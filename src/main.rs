@@ -692,7 +692,13 @@ fn do_pickup(root: &Path, fp: &str) -> Result<(), Fail> {
     let mut input = io::stdin().lock();
     loop {
         match oldest(root, &mine) {
-            None => std::thread::sleep(POLL),
+            None => {
+                if !peer_present(POLL) {
+                    // Not a failure and not a refusal: a courier that
+                    // waited and left has done nothing wrong.
+                    return Ok(());
+                }
+            }
             Some((to, id, path)) => {
                 let mut f = match File::open(&path) {
                     Ok(f) => f,
@@ -787,6 +793,38 @@ fn swept(to: &str, q: &Queue) {
             q.freed
         ));
     }
+}
+
+/// Wait up to `timeout` for anything to change, and answer whether the
+/// courier is still on the other end.
+///
+/// A `pickup` with nothing to hand over blocks, and what it is blocked
+/// on is a connection somebody else can close. sshd does not signal a
+/// forced command when that happens, so a depot that merely slept went
+/// on reading this directory four times a second for as long as the
+/// machine stayed up -- one such process for every courier that ever
+/// disconnected while waiting. Eight of them survived a single run of
+/// the test suite, which is how this was found.
+///
+/// So the sleep is a poll on the client instead: the same quarter
+/// second when nothing happens, and an immediate answer when the far end
+/// hangs up. POLLHUP is the whole signal -- it means the write end is
+/// closed, whether or not bytes are still buffered -- and reading is
+/// deliberately not done here, because the ack reader owns that stream
+/// and a byte taken now would be a byte missing from its next line.
+fn peer_present(timeout: Duration) -> bool {
+    let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    let n = unsafe { libc::poll(&mut p, 1, timeout.as_millis() as libc::c_int) };
+    if n < 0 || p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return false;
+    }
+    if n > 0 {
+        // Readable, and the peer is still there: a courier talking when
+        // nothing was sent to it. Not ours to interpret, but it must not
+        // become a spin, so wait out the interval poll cut short.
+        std::thread::sleep(timeout);
+    }
+    true
 }
 
 fn oldest(root: &Path, mine: &[String]) -> Option<(String, u64, PathBuf)> {

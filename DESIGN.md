@@ -88,6 +88,15 @@ Two intents:
 learns anything: it holds the connection open and the depot answers
 inside it. One-way ssh is one-way about who *initiates*.
 
+What it blocks on is the client as much as the directory. sshd does
+not signal a forced command when its connection closes, so a `pickup`
+that only slept between looks went on reading an empty directory four
+times a second for as long as the machine stayed up, one process per
+courier that ever disconnected while waiting. It waits on the client
+instead: the same quarter second when nothing happens, and an
+immediate exit when the far end hangs up. A courier that waited and
+left has done nothing wrong, so that exit is a 0.
+
 ## Who may collect, and why there is no register
 
 A courier collects for a recipient because an operator said so:

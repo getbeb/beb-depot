@@ -120,4 +120,57 @@ ok "pickup streams it back over ssh, and the ack clears the shelf"
 test "$rc" -eq 2 || die "held exited $rc after everything was collected, wanted 2"
 ok "and the depot is empty again"
 
+# A courier that waits and then leaves. sshd does not signal a forced
+# command when its client goes, so this used to leave a process polling
+# an empty directory forever -- eight of them survived one run of this
+# file, which is how it was found.
+#
+# The connection has to keep stdin open, as a real courier does: a
+# backgrounded ssh is handed /dev/null, and that EOF is itself the
+# courier saying it has gone. Processes are counted by their own command
+# line and killed only by pid, because this machine runs other sshds.
+python3 - "$DEPOT" "$PORT" "$W" <<'PY' || die "the wait, and the leaving"
+import os, subprocess, sys, time
+depot, port, w = sys.argv[1:]
+root = os.path.realpath(os.environ["BEB_DEPOT_ROOT"])
+
+def serving():
+    out = subprocess.run(["ps", "-u", str(os.getuid()), "-o", "pid=,command="],
+                         capture_output=True, text=True).stdout
+    found = []
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if cmd.startswith(depot) and root in cmd:
+            found.append(int(pid))
+    return found
+
+def settle(want, secs=6):
+    for _ in range(int(secs / 0.1)):
+        if len(serving()) == want:
+            return True
+        time.sleep(0.1)
+    return len(serving()) == want
+
+assert settle(0), "a pickup from earlier never noticed its courier had gone"
+
+p = subprocess.Popen(["ssh", "-q", "-p", port, "-i", w + "/courier",
+                      "-o", "StrictHostKeyChecking=no",
+                      "-o", "UserKnownHostsFile=/dev/null",
+                      "-o", "IdentitiesOnly=yes", "127.0.0.1", "pickup"],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=subprocess.DEVNULL)
+try:
+    assert settle(1), "no pickup ever blocked, so nothing here is being tested"
+    p.kill()
+    if not settle(0):
+        left = serving()
+        for pid in left:
+            os.kill(pid, 9)
+        raise AssertionError("%d pickups outlived their courier" % len(left))
+finally:
+    p.kill()
+PY
+ok "a pickup blocks while its courier waits, holding the connection"
+ok "and exits when the courier goes, instead of polling an empty depot forever"
+
 echo "all $n tests passed"
