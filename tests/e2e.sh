@@ -67,10 +67,11 @@ grep -q "may now collect for $KEY1" "$ERR" || die "allow ack: $(cat "$ERR")"
 grep -qx "$A $KEY1" "$BEB_DEPOT_ROOT/allowed" || die "the line is not in the file"
 ok "allow writes one greppable line, and says what it granted"
 
-d allow "$A" "$KEY1" && die "allowing twice reported success"
-test $? -eq 2 || true
+d allow "$A" "$KEY1"; rc=$?
+test "$rc" -eq 2 || die "allowing twice exited $rc, wanted 2 (nothing to do)"
 grep -q 'could already collect' "$ERR" || die "second allow: $(cat "$ERR")"
-ok "allowing twice is nothing to do, not a failure"
+test "$(grep -c . "$BEB_DEPOT_ROOT/allowed")" -eq 1 || die "the line was written twice"
+ok "allowing twice is nothing to do, not a failure, and writes nothing"
 
 # ---- serve: what it will and will not answer ---------------------------
 
@@ -87,7 +88,8 @@ ok "serve refuses a fingerprint sshd would never have given it"
 
 printf 'not a beb frame at all, just bytes' >"$W/f1"
 
-serve "drop $KEY2" "$A" "$W/f1" && die "a drop for an unregistered recipient was held"
+serve "drop $KEY2" "$A" "$W/f1"; rc=$?
+test "$rc" -eq 3 || die "an unregistered drop exited $rc, wanted 3 (refused)"
 grep -q 'nobody collects for' "$ERR" || die "unregistered drop refusal: $(cat "$ERR")"
 grep -q "beb-depot allow" "$ERR" || die "the refusal does not name the fix"
 test -e "$BEB_DEPOT_ROOT/inbox/$KEY2" && die "a refused drop created a queue"
@@ -177,8 +179,15 @@ ok "an empty depot is nothing to do, not a failure"
 # reading stdout gets frames and nothing else.
 serve "drop $KEY1" "$A" "$W/f1" || die "drop for the stream test"
 test -s "$OUT" && die "drop wrote to stdout: $(cat "$OUT")"
-grep -qv '^beb-depot: ' "$ERR" && grep -q . "$ERR" && grep -vq '^beb-depot: ' "$ERR" &&
-    die "a line on stderr carries no prefix: $(cat "$ERR")"
+test -s "$ERR" || die "drop said nothing at all"
+grep -v '^beb-depot: ' "$ERR" >"$W/unprefixed"
+test -s "$W/unprefixed" && die "unprefixed on stderr: $(cat "$W/unprefixed")"
 ok "prose on stderr with a prefix; stdout is frames only"
+
+# The same for a refusal, which is the line an operator actually reads.
+serve "drop $KEY2" "$A" "$W/f1"
+grep -v '^beb-depot: ' "$ERR" >"$W/unprefixed"
+test -s "$W/unprefixed" && die "unprefixed refusal: $(cat "$W/unprefixed")"
+ok "a refusal is prefixed too"
 
 echo "all $n tests passed"

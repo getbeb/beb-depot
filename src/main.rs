@@ -15,7 +15,7 @@ const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 
 /// A frame larger than this is refused before a byte of it is stored.
-/// Not a knob: any registered courier may drop for any registered
+/// Not a knob: any connecting courier may drop for any allowed
 /// recipient, so disk has to be bounded by policy rather than by trust.
 /// beb bodies are uncapped by design, which is a promise beb can make
 /// about its own disk and this cannot make about somebody else's.
@@ -279,7 +279,7 @@ fn do_drop(root: &Path, fp: &str, to: &str) -> Result<(), Fail> {
         return Err(refused(format!("\"{to}\" is not a recipient")));
     }
     // Anyone this depot serves may drop for anyone it holds for. What it
-    // will not do is invent a queue: an unregistered recipient has
+    // will not do is invent a queue: a recipient nobody may collect for has
     // nobody to collect it, so the frame would sit forever.
     if !allowed_line_exists(root, to) {
         return Err(refused(format!(
