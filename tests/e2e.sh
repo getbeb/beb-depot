@@ -62,7 +62,8 @@ ok "an unknown command names the thing that lists them"
 d allow "not-a-fingerprint" "$KEY1" && die "a bad fingerprint was accepted"
 grep -q 'is not a fingerprint' "$ERR" || die "fingerprint refusal: $(cat "$ERR")"
 d allow "$A" "not-a-key" && die "a bad recipient was accepted"
-grep -q 'is not a recipient' "$ERR" || die "recipient refusal: $(cat "$ERR")"
+grep -q 'neither a recipient nor a public key file' "$ERR" ||
+    die "recipient refusal: $(cat "$ERR")"
 grep -q '64 lowercase hex' "$ERR" || die "the refusal does not say what a recipient is"
 ok "allow refuses a fingerprint or a recipient it cannot use, and says which"
 
@@ -99,6 +100,33 @@ printf 'ssh-ed25519 AAAAfake one\nssh-ed25519 AAAAfake two\n' >"$W/two.pub"
 d authorize "$W/two.pub" "$KEY1" && die "a file with two keys was authorized"
 grep -q 'one line names one courier' "$ERR" || die "two-key refusal: $(cat "$ERR")"
 ok "one line names one courier, so a file of keys is refused"
+
+# A recipient may be a key file instead of hex, and must come out the
+# same. The expected value is computed here independently of the depot.
+ssh-keygen -q -t ed25519 -N '' -C bob -f "$W/bob" || die "ssh-keygen"
+BOBHEX=$(python3 -c '
+import base64, struct, sys
+b = base64.b64decode(open(sys.argv[1]).read().split()[1])
+n, = struct.unpack(">I", b[:4]); o = 4 + n
+n, = struct.unpack(">I", b[o:o+4]); o += 4
+print(b[o:o+n].hex())' "$W/bob.pub")
+d authorize "$W/c2.pub" "$W/bob.pub" || die "authorize by key file: $(cat "$ERR")"
+grep -q "may now collect for $BOBHEX" "$ERR" || die "derived the wrong queue: $(cat "$ERR")"
+grep -qF "$BOBHEX" "$BEB_DEPOT_ROOT/allowed" || die "the derived grant is not in allowed"
+ok "a recipient may be a public key file, and the queue name is derived from it"
+
+ssh-keygen -q -t rsa -b 2048 -N '' -C rsa -f "$W/r" >/dev/null 2>&1 || die "ssh-keygen rsa"
+d authorize "$W/c1.pub" "$W/r.pub" && die "an rsa key was accepted as a recipient"
+grep -q 'is ed25519' "$ERR" || die "rsa refusal: $(cat "$ERR")"
+ok "a recipient that is not an ed25519 key is refused by name"
+
+d authorize "$W/c1.pub" "/no/such/file" && die "a missing path was accepted"
+grep -q 'neither a recipient nor a public key file' "$ERR" || die "missing path: $(cat "$ERR")"
+ok "an argument that is neither hex nor a file says so, and what each looks like"
+
+d allow "$A" "$W/bob.pub" || die "allow by key file: $(cat "$ERR")"
+grep -q "may now collect for $BOBHEX" "$ERR" || die "allow derived the wrong queue"
+ok "allow takes a key file too, so the two verbs read the same way"
 
 d authorize "$W/c1.pub" "$KEY1" "$KEY2" || die "authorize: $(cat "$ERR")"
 grep -q "^command=\"" "$OUT" || die "the line is not on stdout: $(cat "$OUT")"

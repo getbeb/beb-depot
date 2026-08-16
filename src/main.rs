@@ -89,13 +89,17 @@ beb-depot holds beb mail for keys that read somewhere else.
       let that courier in, and let it collect for those recipients
   beb-depot serve [--root PATH] FINGERPRINT
       answer one connection; sshd runs this as a forced command
-  beb-depot allow FINGERPRINT KEY
+  beb-depot allow FINGERPRINT RECIPIENT
       one more recipient for a courier already let in
   beb-depot held
       what is waiting, and for whom
 
   beb-depot --help
   beb-depot --version
+
+A RECIPIENT is a queue name, 64 lowercase hex, or the path to a beb
+identity's public key file, which this converts to one. A KEYFILE is a
+courier's public key; its fingerprint is derived, never typed.
 
 Exit: 0 did it, 1 change the command, 2 nothing to do, 3 refused.
 
@@ -183,8 +187,10 @@ fn fsync_dir(d: &Path) -> io::Result<()> {
 }
 
 /// A recipient is a beb mailbox name: the 32 raw ed25519 key bytes in
-/// hex. The depot never derives it -- the courier passes it -- but it
-/// does check the shape, because it becomes a directory name.
+/// hex. On a connection the depot never derives it, the courier passes
+/// it, and this checks the shape because it becomes a directory name.
+/// An operator may hand `authorize` the key file instead and have it
+/// derived, which is a convenience at the desk and never on the wire.
 fn valid_recipient(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
@@ -222,17 +228,16 @@ fn allowed_for(root: &Path, fp: &str) -> Vec<String> {
 fn cmd_allow(args: &[String]) -> Result<(), Fail> {
     let (fp, to) = match args {
         [fp, to] => (fp.as_str(), to.as_str()),
-        _ => return Err("allow takes a fingerprint and a recipient: beb-depot allow FINGERPRINT KEY".into()),
+        _ => {
+            return Err("allow takes a fingerprint and a recipient: \
+                        beb-depot allow FINGERPRINT RECIPIENT"
+                .into())
+        }
     };
     if !valid_fingerprint(fp) {
         return Err(format!("\"{fp}\" is not a fingerprint; ssh-keygen -lf prints one as SHA256:...").into());
     }
-    if !valid_recipient(to) {
-        return Err(format!(
-            "\"{to}\" is not a recipient; it is a beb mailbox name, 64 lowercase hex characters"
-        )
-        .into());
-    }
+    let to = &as_recipient(to)?;
     let root = root()?;
     if !grant(&root, fp, to)? {
         return Err(Fail { code: 2, msg: format!("{fp} could already collect for {to}") });
@@ -304,16 +309,13 @@ fn cmd_authorize(args: &[String]) -> Result<(), Fail> {
                 .into())
         }
     };
-    // Everything is checked before anything is written: a half-authorized
+    // Everything is resolved before anything is written: a half-authorized
     // courier is a key that can connect and collect nothing, which looks
     // like a depot fault rather than a typo.
-    for to in recipients {
-        if !valid_recipient(to) {
-            return Err(refused(format!(
-                "\"{to}\" is not a recipient; it is a beb mailbox name, 64 lowercase hex characters"
-            )));
-        }
-    }
+    let recipients: Vec<String> = recipients
+        .iter()
+        .map(|r| as_recipient(r))
+        .collect::<Result<_, _>>()?;
     let key = read_public_key(keyfile)?;
     let fp = fingerprint_of(keyfile)?;
     let exe = shell_word(&forced_command_binary()?)?;
@@ -352,7 +354,7 @@ fn cmd_authorize(args: &[String]) -> Result<(), Fail> {
     }
 
     let mut added = Vec::new();
-    for to in recipients {
+    for to in &recipients {
         if grant(&root, &fp, to)? {
             added.push(to.as_str());
         }
@@ -379,6 +381,85 @@ fn cmd_authorize(args: &[String]) -> Result<(), Fail> {
         note("sshd needs no reload; it reads authorized_keys on each connection");
     }
     Ok(())
+}
+
+/// A recipient, from either of the two things an operator has to hand.
+///
+/// The queue name is 32 raw ed25519 bytes in hex, and until now it was
+/// the one argument here a human still had to produce by decoding a
+/// base64 blob themselves -- the same transcription hazard `authorize`
+/// exists to remove, left sitting in the other half of the command. beb
+/// prints the key; this turns the key into the queue.
+fn as_recipient(arg: &str) -> Result<String, Fail> {
+    if valid_recipient(arg) {
+        return Ok(arg.to_string());
+    }
+    let p = Path::new(arg);
+    if p.is_file() {
+        return recipient_of(p);
+    }
+    Err(refused(format!(
+        "\"{arg}\" is neither a recipient nor a public key file\n\
+         a recipient is 64 lowercase hex characters; a key file is the .pub of a \
+         beb identity, whose contents beb whoami prints"
+    )))
+}
+
+/// The queue a beb identity reads from: the key bytes, not the key text.
+///
+/// Derived the same way beb names the mailbox -- the second string of
+/// the ssh wire encoding, which for ed25519 is exactly the 32 bytes.
+fn recipient_of(p: &Path) -> Result<String, Fail> {
+    let key = read_public_key(p)?;
+    let mut f = key.split_whitespace();
+    let kind = f.next().unwrap_or_default().to_string();
+    let blob = f.next().unwrap_or_default();
+    let bytes =
+        b64(blob).ok_or_else(|| refused(format!("{}: the key is not base64", p.display())))?;
+    let raw = ssh_string(&bytes, 0)
+        .and_then(|(t, at)| ssh_string(&bytes, at).map(|(k, _)| (t, k)))
+        .filter(|(t, k)| *t == b"ssh-ed25519".as_slice() && k.len() == 32)
+        .map(|(_, k)| k);
+    match raw {
+        Some(k) => Ok(k.iter().map(|b| format!("{b:02x}")).collect()),
+        None => Err(refused(format!(
+            "{} is a {kind} key; a beb identity is ed25519, and its queue name is \
+             those 32 key bytes in hex",
+            p.display()
+        ))),
+    }
+}
+
+/// Enough base64 to read one ssh public key. Written out rather than
+/// depended on: the depot has one dependency, and this is nine lines.
+fn b64(s: &str) -> Option<Vec<u8>> {
+    let (mut out, mut acc, mut bits) = (Vec::new(), 0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// One length-prefixed string of the ssh wire encoding, and where the
+/// next one starts.
+fn ssh_string(b: &[u8], at: usize) -> Option<(&[u8], usize)> {
+    let n = u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?) as usize;
+    let (s, e) = (at + 4, (at + 4).checked_add(n)?);
+    Some((b.get(s..e)?, e))
 }
 
 /// The one key in a public key file, or a refusal saying which it was.

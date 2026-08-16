@@ -101,10 +101,18 @@ left has done nothing wrong, so that exit is a 0.
 
 A courier collects for a recipient because an operator said so:
 
-    beb-depot authorize courier.pub d811f21767d40b61...
+    beb-depot authorize courier.pub bob.pub
 
 One act: the key goes into `authorized_keys` behind the right forced
 command, and the grant goes into `allowed`.
+
+Both arguments are key files, and neither is transcribed. The courier's
+fingerprint comes from `ssh-keygen -lf`; the recipient's queue name is
+the 32 raw ed25519 bytes of the identity key, in hex, derived the same
+way beb names the mailbox. A queue name may still be given directly,
+since that is what a courier puts on the wire, but nobody has to
+produce one by hand -- which they did until `beb whoami > bob.pub` was
+enough, and that asymmetry was the last of the same hazard.
 
 Both halves in one command because the fingerprint is the whole of the
 depot's notion of who is calling, and it used to be typed twice -- once

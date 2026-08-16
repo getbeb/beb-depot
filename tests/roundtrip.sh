@@ -62,6 +62,17 @@ print(b[off:off+n].hex())' "$BOB")
 test ${#BOBHEX} -eq 64 || die "bob's key is not 32 bytes: $BOBHEX"
 ok "an address is an ssh key; a depot queue is those same bytes in hex"
 
+# And the depot agrees, from the key file alone. This is the one place
+# the two programs' idea of a queue name is checked against each other:
+# beb decides it when it writes the outbox, the depot decides it when an
+# operator sets things up, and neither would notice the other drifting.
+printf 'ssh-ed25519 %s bob\n' "$BOB" >"$W/bob.pub"
+"$DEPOT" allow "SHA256:dddd3333333333333333333333333333333333333333" "$W/bob.pub" \
+    >/dev/null 2>"$W/derr" || die "depot allow by key file: $(cat "$W/derr")"
+grep -q "may now collect for $BOBHEX" "$W/derr" ||
+    die "the depot derived a different queue than beb did: $(cat "$W/derr")"
+ok "the depot derives the same queue name from the key that beb derives from it"
+
 # Alice sends to a name that resolves to a key with no mailbox here, so
 # beb spools it instead of delivering it.
 as alice send bob --subject "across" --body "the whole path" \
