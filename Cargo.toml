@@ -1,0 +1,14 @@
+[package]
+name = "beb-depot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "A place beb mail waits when two machines cannot reach each other"
+license = "MIT"
+repository = "https://github.com/getbeb/beb-depot"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+strip = true
