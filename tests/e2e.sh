@@ -257,6 +257,72 @@ assert os.path.exists(os.path.join(root, "inbox", to, "%018d" % int(i))), \
 PY
 ok "a courier that dies mid-transfer leaves the frame where it was"
 
+# ---- limits ------------------------------------------------------------
+
+# Every one of these fills a queue by writing files into it directly
+# rather than by dropping thousands of frames: what is under test is the
+# refusal, not the depot's ability to spend a minute getting there.
+CAPPED=$BEB_DEPOT_ROOT/inbox/$KEY1
+fill() { python3 -c '
+import os, sys
+d, n, size = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+os.makedirs(d, exist_ok=True)
+for i in range(1, n + 1):
+    with open(os.path.join(d, "%018d" % i), "wb") as f:
+        f.truncate(size)   # sparse: the size is real, the disk use is not
+' "$@"; }
+age() { python3 -c '
+import os, sys, time
+d, count, delta = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+t = time.time() + delta
+for n in sorted(os.listdir(d))[:count]:
+    p = os.path.join(d, n); os.utime(p, (t, t))
+' "$@"; }
+
+rm -rf "$CAPPED"; fill "$CAPPED" 10000 1
+serve "drop $KEY1" "$A" "$W/f1"; rc=$?
+test "$rc" -eq 3 || die "a drop onto a full queue exited $rc, wanted 3 (refused)"
+grep -q 'frames, which is the cap' "$ERR" || die "item cap refusal: $(cat "$ERR")"
+grep -q 'until a courier collects' "$ERR" || die "the refusal does not name the fix"
+test "$(ls "$CAPPED" | wc -l | tr -d ' ')" -eq 10000 || die "the refused drop was stored anyway"
+ok "a queue at the item cap takes nothing more, and says what would clear it"
+
+rm -rf "$CAPPED"; fill "$CAPPED" 1 1073741824
+serve "drop $KEY1" "$A" "$W/f1"; rc=$?
+test "$rc" -eq 3 || die "a drop onto a full-by-bytes queue exited $rc, wanted 3"
+grep -q 'bytes, which is the cap' "$ERR" || die "byte cap refusal: $(cat "$ERR")"
+ok "a queue at the byte cap takes nothing more, whatever the item count"
+
+# One byte under, and a frame that would cross it. A frame's size is not
+# knowable until it has been read, so this is the check that happens after.
+rm -rf "$CAPPED"; fill "$CAPPED" 1 1073741823
+serve "drop $KEY1" "$A" "$W/f1"; rc=$?
+test "$rc" -eq 3 || die "a frame crossing the byte cap exited $rc, wanted 3"
+grep -q 'and this frame is' "$ERR" || die "crossing refusal: $(cat "$ERR")"
+test "$(ls "$CAPPED" | wc -l | tr -d ' ')" -eq 1 || die "the frame was kept after being refused"
+ok "a frame that would cross the byte cap is refused once measured, and not kept"
+
+# Expiry. Nothing here waits 30 days; the frames are simply born old.
+rm -rf "$CAPPED"; fill "$CAPPED" 3 10; age "$CAPPED" 2 -2678400
+serve "drop $KEY1" "$A" "$W/f1" || die "drop after expiry: $(cat "$ERR")"
+grep -q 'waited past 30 days' "$ERR" || die "the sweep said nothing: $(cat "$ERR")"
+test "$(ls "$CAPPED" | wc -l | tr -d ' ')" -eq 2 || die "expiry kept or took the wrong ones"
+ok "a drop sweeps what waited past 30 days first, and says how many went"
+
+# The queue nothing else reaches: no sender, no courier, only an operator.
+rm -rf "$CAPPED"; fill "$CAPPED" 2 10; age "$CAPPED" 2 -2678400
+d held; rc=$?
+test "$rc" -eq 2 || die "held exited $rc after sweeping the last frames, wanted 2"
+grep -q 'waited past 30 days' "$ERR" || die "held did not sweep: $(cat "$ERR")"
+test -z "$(ls "$CAPPED")" || die "held left expired frames behind"
+ok "held sweeps the queues nothing else ever touches"
+
+# A clock that moved must never be a reason to delete mail.
+rm -rf "$CAPPED"; fill "$CAPPED" 1 10; age "$CAPPED" 1 3600
+d held || die "held with a future mtime: $(cat "$ERR")"
+test "$(ls "$CAPPED" | wc -l | tr -d ' ')" -eq 1 || die "a frame from the future was deleted"
+ok "a frame whose mtime is ahead of the clock is wrong, not expired"
+
 # ---- an empty depot ----------------------------------------------------
 
 rm -rf "$BEB_DEPOT_ROOT/inbox"

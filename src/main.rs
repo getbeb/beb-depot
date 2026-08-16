@@ -21,6 +21,31 @@ const FILE_MODE: u32 = 0o600;
 /// about its own disk and this cannot make about somebody else's.
 const FRAME_MAX: u64 = 64 * 1024 * 1024;
 
+/// What one recipient may keep waiting, and for how long.
+///
+/// The frame ceiling bounds a single mistake. These bound a persistent
+/// one, which is the case a depot left running unattended actually
+/// meets: a courier that never comes back, or a sender in a loop. Two
+/// caps rather than one because the two ways to fill a disk are not the
+/// same shape -- many small frames exhaust a directory, and an
+/// operator's patience, long before they exhaust the space.
+///
+/// Not knobs, for the same reason FRAME_MAX is not one. A depot cannot
+/// tell a mistake from an attack, so this is the one place it is allowed
+/// an opinion, and an opinion every deployment states differently is not
+/// an opinion.
+const HOLD_MAX_ITEMS: usize = 10_000;
+const HOLD_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// After this, nobody is coming back for it.
+///
+/// Expiry runs on traffic rather than on a timer, because a depot has no
+/// process of its own: every connection is one sshd child that exits. So
+/// a drop, a pickup, and `held` each sweep what they touch. A queue
+/// nothing ever touches is the case this misses, and it is also the case
+/// where those frames are the only thing there.
+const HOLD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// How often a blocked `pickup` looks again.
 ///
 /// A poll, and deliberately. The two intents run in different processes
@@ -73,6 +98,10 @@ beb-depot holds beb mail for keys that read somewhere else.
   beb-depot --version
 
 Exit: 0 did it, 1 change the command, 2 nothing to do, 3 refused.
+
+It holds at most 64 MiB per frame, and per recipient 10000 frames or
+1 GiB, whichever comes first. Anything that has waited more than 30
+days is dropped, swept by whatever touches the queue next.
 
 BEB_DEPOT_ROOT names where it keeps things. It defaults to
 ~/.local/share/beb-depot, and holds:
@@ -546,6 +575,25 @@ fn do_drop(root: &Path, fp: &str, to: &str) -> Result<(), Fail> {
     let dir = inbox(root, to);
     private_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 
+    // Make room before deciding there is none: a queue full of frames
+    // nobody came back for should not refuse the one arriving now.
+    let q = sweep(&dir);
+    swept(to, &q);
+
+    let (items, bytes) = (q.items, q.bytes);
+    if items >= HOLD_MAX_ITEMS {
+        return Err(refused(format!(
+            "{to} is holding {items} frames, which is the cap; \
+             nothing more until a courier collects"
+        )));
+    }
+    if bytes >= HOLD_MAX_BYTES {
+        return Err(refused(format!(
+            "{to} is holding {bytes} bytes, which is the cap of {HOLD_MAX_BYTES}; \
+             nothing more until a courier collects"
+        )));
+    }
+
     let tmp = dir.join(format!(".tmp-{}", std::process::id()));
     let written = {
         let mut f = private_file(&tmp).map_err(|e| format!("cannot write: {e}"))?;
@@ -561,6 +609,17 @@ fn do_drop(root: &Path, fp: &str, to: &str) -> Result<(), Fail> {
         } else {
             format!("frame over {FRAME_MAX} bytes")
         }));
+    }
+    // The size was not knowable before reading it, so the byte cap is
+    // checked once more now that it is. Refusing here costs a write that
+    // is then thrown away, which is the price of not trusting a length
+    // the sender would otherwise have to declare.
+    if bytes + written > HOLD_MAX_BYTES {
+        let _ = fs::remove_file(&tmp);
+        return Err(refused(format!(
+            "{to} is holding {bytes} bytes and this frame is {written} more, \
+             over the cap of {HOLD_MAX_BYTES}; nothing more until a courier collects"
+        )));
     }
 
     let id = next_id(&dir)?;
@@ -622,6 +681,14 @@ fn do_pickup(root: &Path, fp: &str) -> Result<(), Fail> {
             "{fp} collects for nobody here; an operator allows it with: beb-depot allow {fp} <recipient>"
         )));
     }
+    // Once, at the start: a courier must never be handed something the
+    // depot would have thrown away. Not on every poll -- that would be a
+    // directory read per recipient per quarter second, to catch a frame
+    // ageing out during the seconds a connection is actually blocked.
+    for to in &mine {
+        let q = sweep(&inbox(root, to));
+        swept(to, &q);
+    }
     let mut input = io::stdin().lock();
     loop {
         match oldest(root, &mine) {
@@ -660,6 +727,68 @@ fn do_pickup(root: &Path, fp: &str) -> Result<(), Fail> {
 /// Ordered by id within a recipient; between recipients, whoever has the
 /// lowest id goes first, which is arbitrary and does not need to be
 /// otherwise -- two recipients are two conversations.
+/// One queue, after expiry: what went, and what is left.
+///
+/// Both answers from one pass, because deciding whether a frame has
+/// expired means stating it, and that same stat already carries the
+/// length the caps are measured in. Asking separately walked every queue
+/// twice: against an empty queue's 14.9ms, five thousand held added 31ms
+/// to a drop that way, and adds 16ms this way.
+///
+/// Which also retired an ordering that looked like a saving and was not.
+/// Checking the item cap before the byte cap, so a full queue could be
+/// refused "without stating ten thousand files", saved nothing: expiry
+/// had already stated every one of them.
+///
+/// A clock that has moved makes `elapsed` fail, and that counts as not
+/// expired: the one thing a sweep must never do is delete mail because
+/// the time was wrong.
+struct Queue {
+    gone: u64,
+    freed: u64,
+    items: usize,
+    bytes: u64,
+}
+
+fn sweep(dir: &Path) -> Queue {
+    let mut q = Queue { gone: 0, freed: 0, items: 0, bytes: 0 };
+    for id in ids(dir) {
+        let p = dir.join(name(id));
+        let md = match fs::metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let old = md
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > HOLD_MAX_AGE);
+        if old && fs::remove_file(&p).is_ok() {
+            q.gone += 1;
+            q.freed += md.len();
+        } else {
+            q.items += 1;
+            q.bytes += md.len();
+        }
+    }
+    q
+}
+
+fn days(d: Duration) -> u64 {
+    d.as_secs() / (24 * 60 * 60)
+}
+
+fn swept(to: &str, q: &Queue) {
+    if q.gone > 0 {
+        note(&format!(
+            "dropped {} frames for {to} that waited past {} days, {} bytes",
+            q.gone,
+            days(HOLD_MAX_AGE),
+            q.freed
+        ));
+    }
+}
+
 fn oldest(root: &Path, mine: &[String]) -> Option<(String, u64, PathBuf)> {
     mine.iter()
         .filter_map(|to| {
@@ -683,14 +812,13 @@ fn cmd_held(args: &[String]) -> Result<(), Fail> {
             if !valid_recipient(&to) {
                 continue;
             }
-            let held = ids(&e.path());
-            if !held.is_empty() {
-                let bytes: u64 = held
-                    .iter()
-                    .filter_map(|&id| fs::metadata(e.path().join(name(id))).ok())
-                    .map(|m| m.len())
-                    .sum();
-                rows.push((to, held.len(), bytes));
+            // An operator asking what is here is the only thing that
+            // reaches a queue no courier and no sender has touched, so
+            // this is where those get swept.
+            let q = sweep(&e.path());
+            swept(&to, &q);
+            if q.items > 0 {
+                rows.push((to, q.items, q.bytes));
             }
         }
     }

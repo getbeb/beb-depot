@@ -154,11 +154,32 @@ bounded by policy rather than by trust. These are the depot's only
 opinions, and it needs them because it cannot tell a mistake from an
 attack.
 
-Today there is one: a maximum frame size, refused before a byte is
-stored. Still owed are a per-recipient byte and item cap, and an age
-after which a frame is dropped. The frame ceiling bounds a single
-mistake; the other two bound a persistent one, which is the case a
-depot left running unattended actually meets.
+There are three, and they are constants rather than settings, because
+an opinion every deployment states differently is not an opinion:
+
+    64 MiB     one frame, refused before a byte of it is stored
+    10000      frames waiting for one recipient
+    1 GiB      bytes waiting for one recipient
+    30 days    how long any frame may wait
+
+The frame ceiling bounds a single mistake. The per-recipient caps bound
+a persistent one -- a courier that never comes back, a sender in a loop
+-- and there are two of them because the two ways to fill a disk are
+not the same shape: many small frames exhaust a directory, and an
+operator's patience, long before they exhaust the space.
+
+Expiry runs on traffic, not on a timer, because the depot has no
+process of its own -- every connection is one sshd child that exits. A
+drop sweeps the queue it is about to write to, a pickup sweeps the
+queues it may collect from, and `held` sweeps everything, which is what
+reaches a queue no sender and no courier has touched in a month. A
+clock that has moved backwards counts as not expired: the one thing a
+sweep must never do is delete mail because the time was wrong.
+
+A drop pays for this, since deciding what has expired means stating
+every frame in the queue. Against an empty queue's 14.9ms, five
+thousand frames waiting add 16ms -- and the same pass yields the counts
+the caps are checked against, so nothing is walked twice.
 
 ## What it trusts
 
