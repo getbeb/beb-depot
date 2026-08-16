@@ -60,10 +60,12 @@ impl From<&str> for Fail {
 const USAGE: &str = "\
 beb-depot holds beb mail for keys that read somewhere else.
 
-  beb-depot serve FINGERPRINT
+  beb-depot authorize KEYFILE RECIPIENT...
+      let that courier in, and let it collect for those recipients
+  beb-depot serve [--root PATH] FINGERPRINT
       answer one connection; sshd runs this as a forced command
   beb-depot allow FINGERPRINT KEY
-      let that courier collect for that recipient
+      one more recipient for a courier already let in
   beb-depot held
       what is waiting, and for whom
 
@@ -78,14 +80,19 @@ BEB_DEPOT_ROOT names where it keeps things. It defaults to
   allowed                    one \"FINGERPRINT RECIPIENT\" line each
   inbox/<recipient>/<id>     one whole frame per file
 
-The line sshd needs, once per courier:
+BEB_DEPOT_AUTHORIZED_KEYS names the file authorize writes. It defaults
+to ~/.ssh/authorized_keys, and gains one line per courier:
 
-  command=\"beb-depot serve SHA256:...\",restrict ssh-ed25519 AAAA...";
+  command=\"'/path/to/beb-depot' serve --root '/path' SHA256:...\",restrict ssh-...
+
+That fingerprint is the depot's whole notion of who is calling, which
+is why authorize derives it from the key file rather than asking.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = match args.first().map(String::as_str) {
         Some("serve") => cmd_serve(&args[1..]),
+        Some("authorize") => cmd_authorize(&args[1..]),
         Some("allow") => cmd_allow(&args[1..]),
         Some("held") => cmd_held(&args[1..]),
         Some("--help") | Some("-h") | None => {
@@ -198,11 +205,23 @@ fn cmd_allow(args: &[String]) -> Result<(), Fail> {
         .into());
     }
     let root = root()?;
-    private_dir_all(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
-    let path = allowed_path(&root);
-    if allowed_for(&root, fp).iter().any(|r| r == to) {
+    if !grant(&root, fp, to)? {
         return Err(Fail { code: 2, msg: format!("{fp} could already collect for {to}") });
     }
+    note(&format!("{fp} may now collect for {to}"));
+    Ok(())
+}
+
+/// Write one grant. `false` means it was already there, which is the
+/// only reason two verbs can write this file: adding a line that exists
+/// is not an event, so `authorize` can re-run over a courier that has
+/// gained one recipient without arguing about the others.
+fn grant(root: &Path, fp: &str, to: &str) -> Result<bool, String> {
+    private_dir_all(root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+    if allowed_for(root, fp).iter().any(|r| r == to) {
+        return Ok(false);
+    }
+    let path = allowed_path(root);
     let mut text = fs::read_to_string(&path).unwrap_or_default();
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
@@ -213,8 +232,232 @@ fn cmd_allow(args: &[String]) -> Result<(), Fail> {
         .and_then(|mut f| f.write_all(text.as_bytes()).and_then(|_| f.sync_all()))
         .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     fs::rename(&tmp, &path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    fsync_dir(&root).map_err(|e| format!("cannot sync {}: {e}", root.display()))?;
-    note(&format!("{fp} may now collect for {to}"));
+    fsync_dir(root).map_err(|e| format!("cannot sync {}: {e}", root.display()))?;
+    Ok(true)
+}
+
+// ---- letting a courier in ----------------------------------------------
+
+/// Where sshd looks. Overridable because a depot is sometimes not the
+/// account you are logged in as, and because a test must never write to
+/// the real one.
+fn authorized_keys_path() -> Result<PathBuf, String> {
+    if let Some(p) = std::env::var_os("BEB_DEPOT_AUTHORIZED_KEYS").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(p));
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "HOME is not set, so there is no ~/.ssh/authorized_keys to write".to_string())?;
+    Ok(PathBuf::from(home).join(".ssh/authorized_keys"))
+}
+
+/// The one line sshd needs, written rather than dictated.
+///
+/// The fingerprint in that line is the depot's entire notion of who is
+/// calling, and until now an operator typed it twice: once here and
+/// once into `allowed`. Two hand-copies of the same 43 base64
+/// characters, in two files, that must agree -- and when they disagree
+/// nothing detects it, because from the depot's side the fingerprint is
+/// the truth. One courier silently collects another's mail.
+///
+/// gitolite solved this by never letting an operator write the line at
+/// all: it generates authorized_keys from a directory where the
+/// filename is the user. Same idea, smaller: derive the fingerprint
+/// from the key file, write both places in one act, and the operator
+/// never transcribes it. What is left for a human is the decision --
+/// this key, these recipients -- which is the part a human should have.
+fn cmd_authorize(args: &[String]) -> Result<(), Fail> {
+    let (keyfile, recipients) = match args {
+        [k, rest @ ..] if !rest.is_empty() => (Path::new(k.as_str()), rest),
+        _ => {
+            return Err("authorize takes a public key file and at least one recipient: \
+                        beb-depot authorize KEYFILE RECIPIENT..."
+                .into())
+        }
+    };
+    // Everything is checked before anything is written: a half-authorized
+    // courier is a key that can connect and collect nothing, which looks
+    // like a depot fault rather than a typo.
+    for to in recipients {
+        if !valid_recipient(to) {
+            return Err(refused(format!(
+                "\"{to}\" is not a recipient; it is a beb mailbox name, 64 lowercase hex characters"
+            )));
+        }
+    }
+    let key = read_public_key(keyfile)?;
+    let fp = fingerprint_of(keyfile)?;
+    let exe = shell_word(&forced_command_binary()?)?;
+    // Resolved now, absolute, and written into the line: whatever root
+    // this operator is granting in is the root the connection will serve
+    // from, whether or not anything is set in the environment then.
+    let root = root()?;
+    private_dir_all(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+    let abs = fs::canonicalize(&root)
+        .map_err(|e| Fail::from(format!("cannot resolve {}: {e}", root.display())))?;
+    let rootword = shell_word(&abs.to_string_lossy())?;
+    let line = format!("command=\"{exe} serve --root {rootword} {fp}\",restrict {key}");
+
+    let ak = authorized_keys_path()?;
+    let existing = fs::read_to_string(&ak).unwrap_or_default();
+    // The bug this verb exists to prevent, caught rather than created:
+    // the key is already in there under somebody else's fingerprint.
+    let blob = key.split_whitespace().nth(1).unwrap_or_default();
+    for (i, l) in existing.lines().enumerate() {
+        if l.contains(blob) && !l.contains(fp.as_str()) {
+            return Err(refused(format!(
+                "line {} of {} already has this key, under a different command:\n  {}\n\
+                 that line decides who the depot thinks is calling; fix or remove it first",
+                i + 1,
+                ak.display(),
+                l.trim()
+            )));
+        }
+    }
+    // Matched on the fingerprint alone, never on the whole command: the
+    // command gained --root once already, and a line that stops matching
+    // when the format shifts is a line that gets silently written twice.
+    let keyed = existing.lines().any(|l| l.contains(fp.as_str()));
+    if !keyed {
+        append_line(&ak, &line)?;
+    }
+
+    let mut added = Vec::new();
+    for to in recipients {
+        if grant(&root, &fp, to)? {
+            added.push(to.as_str());
+        }
+    }
+
+    // stdout carries the line, so it can be piped to a depot elsewhere
+    // even when this run had nothing of its own to write.
+    println!("{line}");
+    if keyed && added.is_empty() {
+        return Err(Fail {
+            code: 2,
+            msg: format!("{fp} was already authorized for all {} recipients", recipients.len()),
+        });
+    }
+    if !keyed {
+        note(&format!("added {} to {}", fp, ak.display()));
+    }
+    match added.len() {
+        0 => note(&format!("{fp} could already collect for every one of those")),
+        1 => note(&format!("{fp} may now collect for {}", added[0])),
+        n => note(&format!("{fp} may now collect for {n} recipients")),
+    }
+    if !keyed {
+        note("sshd needs no reload; it reads authorized_keys on each connection");
+    }
+    Ok(())
+}
+
+/// The one key in a public key file, or a refusal saying which it was.
+fn read_public_key(p: &Path) -> Result<String, Fail> {
+    let text = fs::read_to_string(p)
+        .map_err(|e| Fail::from(format!("cannot read {}: {e}", p.display())))?;
+    if text.contains("PRIVATE KEY") {
+        return Err(refused(format!(
+            "{} is a private key; authorize takes the public half, usually the same name with .pub",
+            p.display()
+        )));
+    }
+    let keys: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let key = match keys.as_slice() {
+        [one] => *one,
+        [] => return Err(refused(format!("{} holds no key", p.display()))),
+        many => {
+            return Err(refused(format!(
+                "{} holds {} keys; authorize takes one, so that one line names one courier",
+                p.display(),
+                many.len()
+            )))
+        }
+    };
+    let mut f = key.split_whitespace();
+    let kind = f.next().unwrap_or_default();
+    if f.next().is_none() || !(kind.starts_with("ssh-") || kind.starts_with("ecdsa-sha2-") || kind.starts_with("sk-")) {
+        return Err(refused(format!(
+            "{} does not look like a public key; expected a line beginning ssh-ed25519, ssh-rsa, or similar",
+            p.display()
+        )));
+    }
+    Ok(key.to_string())
+}
+
+/// ssh-keygen's answer, not ours. Computing a fingerprint here would
+/// mean owning a second opinion about what sshd will compute, and the
+/// only opinion that matters is sshd's.
+fn fingerprint_of(p: &Path) -> Result<String, Fail> {
+    let out = std::process::Command::new("ssh-keygen")
+        .arg("-lf")
+        .arg(p)
+        .output()
+        .map_err(|e| Fail::from(format!("cannot run ssh-keygen: {e}")))?;
+    if !out.status.success() {
+        return Err(refused(format!(
+            "ssh-keygen will not read {}: {}",
+            p.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let fp = text.split_whitespace().nth(1).unwrap_or_default().to_string();
+    if !valid_fingerprint(&fp) {
+        return Err(format!("ssh-keygen printed no fingerprint for {}", p.display()).into());
+    }
+    Ok(fp)
+}
+
+/// This binary, by absolute path. A forced command runs with no useful
+/// PATH, and naming the binary that wrote the line is the only way the
+/// line stays true when a depot is installed somewhere unusual.
+fn forced_command_binary() -> Result<String, Fail> {
+    let exe = std::env::current_exe()
+        .map_err(|e| Fail::from(format!("cannot find my own path: {e}")))?;
+    Ok(exe.to_string_lossy().to_string())
+}
+
+/// One argument of the forced command, safe for the shell sshd hands it
+/// to. `command="..."` is not the end of the quoting: sshd runs the
+/// string through the login shell, so a path with a space in it becomes
+/// two arguments unless something says otherwise.
+fn shell_word(s: &str) -> Result<String, Fail> {
+    if s.contains('\'') || s.contains('"') || s.contains('\\') || s.contains('\n') {
+        return Err(refused(format!(
+            "{s} cannot go in a forced command; a quote or a backslash in the path \
+             would end the line early. move it somewhere plainer"
+        )));
+    }
+    Ok(format!("'{s}'"))
+}
+
+/// Appended, never rewritten. authorized_keys is a file sshd depends on
+/// and other things edit; replacing it wholesale to add one line risks
+/// losing whatever arrived in between, and this verb's whole purpose is
+/// to be the safe way to touch it.
+fn append_line(p: &Path, line: &str) -> Result<(), Fail> {
+    if let Some(d) = p.parent() {
+        private_dir_all(d).map_err(|e| Fail::from(format!("cannot create {}: {e}", d.display())))?;
+    }
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(FILE_MODE)
+        .open(p)
+        .map_err(|e| Fail::from(format!("cannot open {}: {e}", p.display())))?;
+    // A file that does not end in a newline would otherwise gain a line
+    // that is the tail of the previous one, and sshd would read neither.
+    let needs_nl = fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+        && !fs::read_to_string(p).unwrap_or_default().ends_with('\n');
+    let text = if needs_nl { format!("\n{line}\n") } else { format!("{line}\n") };
+    f.write_all(text.as_bytes())
+        .and_then(|_| f.sync_all())
+        .map_err(|e| Fail::from(format!("cannot write {}: {e}", p.display())))?;
     Ok(())
 }
 
@@ -251,14 +494,28 @@ fn ids(dir: &Path) -> Vec<u64> {
 /// client asked for and is therefore never trusted for anything but
 /// which branch to take.
 fn cmd_serve(args: &[String]) -> Result<(), Fail> {
-    let fp = match args {
-        [fp] => fp.as_str(),
-        _ => return Err("serve takes the connecting fingerprint: beb-depot serve FINGERPRINT".into()),
+    // sshd runs a forced command with none of the operator's environment,
+    // so a depot whose root came from BEB_DEPOT_ROOT would serve out of
+    // ~/.local/share/beb-depot and find no grants at all -- silently,
+    // because an empty allow list and a wrong allow list look the same
+    // from here. The line carries the root so the environment cannot
+    // disagree with it.
+    let (given, fp) = match args {
+        [flag, path, fp] if flag == "--root" => (Some(PathBuf::from(path)), fp.as_str()),
+        [fp] => (None, fp.as_str()),
+        _ => {
+            return Err("serve takes the connecting fingerprint: \
+                        beb-depot serve [--root PATH] FINGERPRINT"
+                .into())
+        }
     };
     if !valid_fingerprint(fp) {
         return Err(format!("\"{fp}\" is not a fingerprint").into());
     }
-    let root = root()?;
+    let root = match given {
+        Some(r) => r,
+        None => root()?,
+    };
     let asked = std::env::var("SSH_ORIGINAL_COMMAND").unwrap_or_default();
     let mut words = asked.split_whitespace();
     match (words.next(), words.next(), words.next()) {

@@ -60,12 +60,21 @@ right shape at a scale this depot does not have.
 sshd runs the depot as a forced command, with the connecting courier's
 fingerprint baked into the line:
 
-    command="beb-depot serve SHA256:abc...",restrict ssh-ed25519 AAAA...
+    command="'/usr/local/bin/beb-depot' serve --root '/srv/beb' SHA256:abc...",restrict ssh-ed25519 AAAA...
 
 So the depot never decides who is calling; sshd decided, and the
 fingerprint is not something the caller can change. A courier cannot
 ask for another's mail because it cannot reach it, which is better
 than a check that says no.
+
+Everything the connection needs is in that line, because a forced
+command inherits none of the operator's environment: no PATH worth
+using and no `BEB_DEPOT_ROOT`. A depot that read its root from the
+environment would serve out of the default one and find no grants at
+all -- silently, since an empty allow list and the wrong allow list
+look identical from inside. Each argument is single-quoted because
+sshd hands the string to a shell, so a path with a space in it would
+otherwise arrive as two arguments.
 
 Two intents:
 
@@ -83,17 +92,40 @@ inside it. One-way ssh is one-way about who *initiates*.
 
 A courier collects for a recipient because an operator said so:
 
-    beb-depot allow SHA256:abc... d811f21767d40b61...
+    beb-depot authorize courier.pub d811f21767d40b61...
 
-One line, next to the `authorized_keys` line that let the courier
-connect at all. The design once had a `register` verb instead -- the
-courier presenting a claim signed by each identity it holds, binding
-the identity key, the courier key, this depot, the operation, a nonce
-and an expiry -- and that protocol is right, but it buys one thing:
-adding an identity to a machine without an operator touching the
-depot. That is a scaling property, not a correctness one, and it is
-not worth a signature-verification path here while the trust boundary
-is already a human act at the same moment.
+One act: the key goes into `authorized_keys` behind the right forced
+command, and the grant goes into `allowed`.
+
+Both halves in one command because the fingerprint is the whole of the
+depot's notion of who is calling, and it used to be typed twice -- once
+into each file, 43 base64 characters that had to agree. When they
+disagreed nothing noticed, because from inside the depot the
+fingerprint simply *is* the caller; a mistyped one means one courier
+quietly collecting another's mail. So `authorize` derives it with
+`ssh-keygen -lf` and nobody transcribes anything. It also refuses a key
+that is already in `authorized_keys` under a different command, which
+is the same mistake arriving from the other direction.
+
+This is gitolite's answer, which solves the identical problem -- one
+Unix account, many keys, a forced command carrying the identity -- by
+generating `authorized_keys` rather than letting an operator write it.
+What stays human is the decision: this key, these recipients.
+
+`allow` remains for the case where the key is already in
+`authorized_keys`: one more recipient, no new courier.
+
+The design once had a `register` verb instead -- the courier
+presenting a claim signed by each identity it holds, binding the
+identity key, the courier key, this depot, the operation, a nonce and
+an expiry -- and that protocol is right, but it buys one thing: adding
+an identity to a machine without an operator touching the depot. That
+is a scaling property, not a correctness one.
+
+It is worth noticing what the real problem with operator-granted
+access turned out to be. It was never that a human decides; it was
+that a human transcribes. `authorize` fixes the transcription, and a
+signature-verification path stops being worth its weight.
 
 The two are not alternatives to hold side by side. A depot that
 verifies signed claims does not also want a second, weaker way to

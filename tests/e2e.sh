@@ -31,6 +31,9 @@ A="SHA256:aaaa0000000000000000000000000000000000000000"
 B="SHA256:bbbb1111111111111111111111111111111111111111"
 KEY1=d811f21767d40b61a3c093d423fdd05f358ef53d07ba4c99691215c8ba0d756e
 KEY2=0c74b660a5d210f74a832fede9cf5a6dd9068ea0c6de2f4996b3e40cd2d3e3d6
+KEY3=3f2a91c0e7b84d16f5c03a8e2d9b7461fa50e83c2b1d6970a4e8fc35d20b7e19
+# Granted to nobody, ever, so a drop for it has no one to collect it.
+NOBODY=9e1d4c7a8b02f36510ad9c84e2b7f019354dc86a1f0b729e4d38c5a06e91b2f7
 
 d() { "$DEPOT" "$@" >"$OUT" 2>"$ERR"; }
 serve() { # <intent> <fingerprint> [stdin file]
@@ -45,7 +48,8 @@ grep -q '^beb-depot [0-9]' "$OUT" || die "--version shape: $(cat "$OUT")"
 ok "--version"
 
 d --help || die "--help"
-grep -q 'beb-depot serve FINGERPRINT' "$OUT" || die "--help lists no serve"
+grep -q 'beb-depot serve' "$OUT" || die "--help lists no serve"
+grep -q 'beb-depot authorize' "$OUT" || die "--help lists no authorize"
 grep -q 'Exit: 0 did it' "$OUT" || die "--help omits the exit table"
 ok "--help names the verbs and the exit codes"
 
@@ -73,6 +77,93 @@ grep -q 'could already collect' "$ERR" || die "second allow: $(cat "$ERR")"
 test "$(grep -c . "$BEB_DEPOT_ROOT/allowed")" -eq 1 || die "the line was written twice"
 ok "allowing twice is nothing to do, not a failure, and writes nothing"
 
+# ---- authorize ---------------------------------------------------------
+
+export BEB_DEPOT_AUTHORIZED_KEYS=$W/authorized_keys
+ssh-keygen -q -t ed25519 -N '' -C courier1 -f "$W/c1" || die "ssh-keygen"
+ssh-keygen -q -t ed25519 -N '' -C courier2 -f "$W/c2" || die "ssh-keygen"
+FP1=$(ssh-keygen -lf "$W/c1.pub" | awk '{print $2}')
+
+d authorize "$W/c1.pub" && die "authorize with no recipient succeeded"
+grep -q 'at least one recipient' "$ERR" || die "arity refusal: $(cat "$ERR")"
+d authorize "$W/c1.pub" "not-a-key" && die "a bad recipient was authorized"
+test -e "$BEB_DEPOT_AUTHORIZED_KEYS" && die "a refused authorize wrote the key in anyway"
+ok "authorize checks every recipient before it writes anything"
+
+d authorize "$W/c1" "$KEY1" && die "a private key was authorized"
+grep -q 'is a private key' "$ERR" || die "private key refusal: $(cat "$ERR")"
+grep -q '\.pub' "$ERR" || die "the refusal does not name the public half"
+ok "handing it a private key is refused by name, not by parse error"
+
+printf 'ssh-ed25519 AAAAfake one\nssh-ed25519 AAAAfake two\n' >"$W/two.pub"
+d authorize "$W/two.pub" "$KEY1" && die "a file with two keys was authorized"
+grep -q 'one line names one courier' "$ERR" || die "two-key refusal: $(cat "$ERR")"
+ok "one line names one courier, so a file of keys is refused"
+
+d authorize "$W/c1.pub" "$KEY1" "$KEY2" || die "authorize: $(cat "$ERR")"
+grep -q "^command=\"" "$OUT" || die "the line is not on stdout: $(cat "$OUT")"
+grep -q "$FP1" "$OUT" || die "the line carries no fingerprint: $(cat "$OUT")"
+grep -q ',restrict ' "$OUT" || die "the line does not restrict: $(cat "$OUT")"
+grep -qF "$(cat "$W/c1.pub" | awk '{print $2}')" "$BEB_DEPOT_AUTHORIZED_KEYS" ||
+    die "the key is not in authorized_keys"
+test "$(grep -c "$FP1" "$BEB_DEPOT_ROOT/allowed")" -eq 2 || die "both grants were not written"
+ok "authorize writes the sshd line and both grants in one act"
+
+# The fingerprint nobody typed: it must be the one ssh-keygen computes.
+grep -qF "$FP1" "$BEB_DEPOT_AUTHORIZED_KEYS" || die "the written fingerprint is not ssh-keygen's"
+ok "the fingerprint in the line is derived, never transcribed"
+
+# It must be usable: serve accepts what authorize wrote.
+SSH_ORIGINAL_COMMAND="pickup" timeout 1 "$DEPOT" serve "$FP1" >/dev/null 2>"$ERR"
+grep -q 'collects for nobody' "$ERR" && die "the fingerprint authorize wrote collects nothing"
+ok "the fingerprint authorize wrote is the one serve honours"
+
+# sshd runs a forced command with none of the operator's environment, so
+# the root has to travel in the line. A live sshd caught this; this keeps
+# it caught. Every argument is quoted because sshd hands the string to a
+# shell, and a path with a space in it would otherwise become two.
+ROOTREAL=$(cd "$BEB_DEPOT_ROOT" && pwd -P)
+grep -qF "serve --root '$ROOTREAL'" "$BEB_DEPOT_AUTHORIZED_KEYS" ||
+    die "the line does not carry the root: $(cat "$BEB_DEPOT_AUTHORIZED_KEYS")"
+grep -q "^command=\"'" "$BEB_DEPOT_AUTHORIZED_KEYS" || die "the binary is not quoted for the shell"
+ok "the line carries the root, quoted, because a forced command has no environment"
+
+# The proof it matters: three roots, and the frame must land in the one
+# named on the command line rather than the one in the environment.
+env BEB_DEPOT_ROOT="$W/other" "$DEPOT" allow "$FP1" "$KEY1" >/dev/null 2>&1 ||
+    die "allow in a second root"
+SSH_ORIGINAL_COMMAND="drop $KEY1" env BEB_DEPOT_ROOT="$W/nowhere" \
+    "$DEPOT" serve --root "$W/other" "$FP1" <"$W/c1.pub" >/dev/null 2>"$ERR" ||
+    die "serve --root did not override the environment: $(cat "$ERR")"
+test -s "$W/other/inbox/$KEY1/000000000000000001" || die "the frame is not in the named root"
+test -d "$W/nowhere" && die "serve wrote to the root named in the environment"
+test -e "$BEB_DEPOT_ROOT/inbox/$KEY1" && die "serve wrote to the default root"
+ok "--root wins over the environment, which is the whole point of it"
+
+d authorize "$W/c1.pub" "$KEY1" "$KEY2"; rc=$?
+test "$rc" -eq 2 || die "re-authorizing exited $rc, wanted 2 (nothing to do)"
+test "$(grep -c "$FP1" "$BEB_DEPOT_AUTHORIZED_KEYS")" -eq 1 || die "the sshd line was written twice"
+grep -q "^command=\"" "$OUT" || die "a no-op authorize printed no line"
+ok "re-authorizing is nothing to do, prints the line, and duplicates neither file"
+
+d authorize "$W/c1.pub" "$KEY1" "$KEY2" "$KEY3" || die "adding one recipient: $(cat "$ERR")"
+test "$(grep -c "$FP1" "$BEB_DEPOT_AUTHORIZED_KEYS")" -eq 1 || die "the sshd line was written twice"
+test "$(grep -c "$FP1" "$BEB_DEPOT_ROOT/allowed")" -eq 3 || die "the third grant is missing"
+ok "re-running with one more recipient adds only the one"
+
+# The bug the verb exists to prevent: this key, somebody else's command.
+FP2=$(ssh-keygen -lf "$W/c2.pub" | awk '{print $2}')
+printf 'command="beb-depot serve %s",restrict %s\n' "$FP2" "$(cat "$W/c2.pub")" \
+    >>"$BEB_DEPOT_AUTHORIZED_KEYS"
+sed -i.bak "s|serve $FP2|serve $FP1|" "$BEB_DEPOT_AUTHORIZED_KEYS"
+d authorize "$W/c2.pub" "$KEY1" && die "a key under the wrong fingerprint was accepted"
+grep -q 'under a different command' "$ERR" || die "mismatch refusal: $(cat "$ERR")"
+grep -q 'who the depot thinks is calling' "$ERR" || die "the refusal does not say why it matters"
+ok "a key already in there under another fingerprint is refused, with the line number"
+
+sed -i.bak "s|serve $FP1|serve $FP2|2" "$BEB_DEPOT_AUTHORIZED_KEYS"
+rm -f "$BEB_DEPOT_AUTHORIZED_KEYS".bak
+
 # ---- serve: what it will and will not answer ---------------------------
 
 serve "" "$A" && die "an empty intent was served"
@@ -88,11 +179,11 @@ ok "serve refuses a fingerprint sshd would never have given it"
 
 printf 'not a beb frame at all, just bytes' >"$W/f1"
 
-serve "drop $KEY2" "$A" "$W/f1"; rc=$?
+serve "drop $NOBODY" "$A" "$W/f1"; rc=$?
 test "$rc" -eq 3 || die "an unregistered drop exited $rc, wanted 3 (refused)"
 grep -q 'nobody collects for' "$ERR" || die "unregistered drop refusal: $(cat "$ERR")"
 grep -q "beb-depot allow" "$ERR" || die "the refusal does not name the fix"
-test -e "$BEB_DEPOT_ROOT/inbox/$KEY2" && die "a refused drop created a queue"
+test -e "$BEB_DEPOT_ROOT/inbox/$NOBODY" && die "a refused drop created a queue"
 ok "a drop nobody could ever collect is refused, and nothing is created"
 
 serve "drop $KEY1" "$A" "$W/f1" || die "drop: $(cat "$ERR")"
@@ -185,7 +276,7 @@ test -s "$W/unprefixed" && die "unprefixed on stderr: $(cat "$W/unprefixed")"
 ok "prose on stderr with a prefix; stdout is frames only"
 
 # The same for a refusal, which is the line an operator actually reads.
-serve "drop $KEY2" "$A" "$W/f1"
+serve "drop $NOBODY" "$A" "$W/f1"
 grep -v '^beb-depot: ' "$ERR" >"$W/unprefixed"
 test -s "$W/unprefixed" && die "unprefixed refusal: $(cat "$W/unprefixed")"
 ok "a refusal is prefixed too"

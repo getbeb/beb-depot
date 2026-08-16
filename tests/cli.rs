@@ -24,6 +24,14 @@ fn e2e() {
 /// The joint with beb, which neither repository's own suite covers. It
 /// needs a beb to test against; a sibling checkout is where it lives
 /// during development, and the script skips if there is none anywhere.
+/// The depot behind a real sshd. Skips where none can be started; the
+/// environment a forced command gets is not something a stub can model,
+/// and this is the suite that found it.
+#[test]
+fn sshd() {
+    run("sshd.sh", None);
+}
+
 #[test]
 fn roundtrip() {
     let sibling = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
