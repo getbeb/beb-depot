@@ -86,9 +86,10 @@ and by the depot's own premise that is the exception:
 ```
 ssh laptop 'ls ~/.local/share/beb' | grep -E '^[0-9a-f]{64}$' |
     xargs beb-depot authorize courier.pub
-``` Later ones can be added with
-`beb-depot allow <fingerprint> <recipient>`, or by re-running `authorize` with
-the fuller list, which adds only what is new.
+```
+
+Later ones can be added with `beb-depot allow <fingerprint> <recipient>`, or by
+re-running `authorize` with the fuller list, which adds only what is new.
 
 ## Using it
 
