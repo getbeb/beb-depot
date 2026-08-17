@@ -76,8 +76,12 @@ account is reached through another login, that is the whole of its
 side, with nothing left behind to clean up:
 
 ```sh
-ssh depot "su -s /bin/sh beb -c 'beb-depot authorize /dev/stdin'" < alice.handover
+ssh depot "su -s /bin/sh beb -c 'beb-depot authorize -'" < alice.handover
 ```
+
+`-` is the descriptor already open, not the path `/dev/stdin`. They
+differ exactly here: `su` changes uid, and re-opening `/dev/stdin`
+after that is a permission error on a pipe the first user owns.
 
 ## Commands
 

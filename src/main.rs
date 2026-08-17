@@ -99,9 +99,9 @@ beb-depot holds beb mail for keys that read somewhere else.
 
 A RECIPIENT is a queue name, 64 lowercase hex, or the path to a beb
 identity's public key file, which this converts to one. A KEYFILE is a
-courier's public key; its fingerprint is derived, never typed. If it is
-what beb-courier whoami printed, it names its own recipients and you
-need give none.
+courier's public key, or \"-\" for stdin; its fingerprint is derived,
+never typed. If it is what beb-courier whoami printed, it names its own
+recipients and you need give none.
 
 Exit: 0 did it, 1 change the command, 2 nothing to do, 3 refused.
 
@@ -499,12 +499,29 @@ struct Handover {
 }
 
 fn read_handover(p: &Path) -> Result<Handover, Fail> {
-    let text = fs::read_to_string(p)
-        .map_err(|e| Fail::from(format!("cannot read {}: {e}", p.display())))?;
+    // "-" is the descriptor already open, not the path /dev/stdin.
+    //
+    // They are not the same thing where it matters. A depot account is
+    // reached through another login -- ssh in as somebody who may become
+    // it -- and `su` changes uid, after which re-opening /dev/stdin is
+    // EACCES on a pipe the first user owns. The inherited descriptor
+    // stays readable, so this reads that:
+    //
+    //   ssh depot "su -s /bin/sh beb -c 'beb-depot authorize -'" < x
+    let dash = p == Path::new("-");
+    let name = if dash { "the handover on stdin".to_string() } else { p.display().to_string() };
+    let text = if dash {
+        let mut s = String::new();
+        io::stdin()
+            .read_to_string(&mut s)
+            .map_err(|e| Fail::from(format!("cannot read {name}: {e}")))?;
+        s
+    } else {
+        fs::read_to_string(p).map_err(|e| Fail::from(format!("cannot read {name}: {e}")))?
+    };
     if text.contains("PRIVATE KEY") {
         return Err(refused(format!(
-            "{} is a private key; authorize takes the public half, usually the same name with .pub",
-            p.display()
+            "{name} is a private key; authorize takes the public half, usually the same name with .pub"
         )));
     }
     let (mut keys, mut recipients) = (Vec::new(), Vec::new());
@@ -521,11 +538,10 @@ fn read_handover(p: &Path) -> Result<Handover, Fail> {
     }
     let key = match keys.as_slice() {
         [one] => *one,
-        [] => return Err(refused(format!("{} holds no key", p.display()))),
+        [] => return Err(refused(format!("{name} holds no key"))),
         many => {
             return Err(refused(format!(
-                "{} holds {} keys; authorize takes one, so that one line names one courier",
-                p.display(),
+                "{name} holds {} keys; authorize takes one, so that one line names one courier",
                 many.len()
             )))
         }
@@ -534,8 +550,7 @@ fn read_handover(p: &Path) -> Result<Handover, Fail> {
     let kind = f.next().unwrap_or_default();
     if f.next().is_none() || !(kind.starts_with("ssh-") || kind.starts_with("ecdsa-sha2-") || kind.starts_with("sk-")) {
         return Err(refused(format!(
-            "{} does not look like a public key; expected a line beginning ssh-ed25519, ssh-rsa, or similar",
-            p.display()
+            "{name} does not look like a public key; expected a line beginning ssh-ed25519, ssh-rsa, or similar"
         )));
     }
     Ok(Handover { key: key.to_string(), recipients })
