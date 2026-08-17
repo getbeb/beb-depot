@@ -37,14 +37,24 @@ unit file: every connection is one sshd child that exits.
 ssh-keygen -t ed25519 -C courier@laptop -f ~/.ssh/beb_courier
 ```
 
-Then, for each beb identity that machine reads for:
+Then list the identities that machine reads for. beb names each mailbox for the
+identity's key, so the spool already holds the answer:
 
 ```
-beb whoami > bob.pub
+$ ls "${XDG_DATA_HOME:-$HOME/.local/share}/beb" | grep -E '^[0-9a-f]{64}$'
+bb68ed0016fd16b5b04cd295b0433c3a54e15f34dcf898ca248dfb34dfa446f0
 ```
 
-`beb whoami` prints the identity's public key on stdout, which is already the
-shape of a key file. Send that and `beb_courier.pub` to whoever runs the depot.
+Those are queue names as the depot wants them. The filter matters: `outbox` is
+a sibling of the mailboxes. Sending never invents a mailbox for a stranger, so
+what is left is exactly who reads here, and each appears at `beb init` rather
+than on first delivery, which is when you need it.
+
+Send that list and `beb_courier.pub` to whoever runs the depot.
+
+For one identity, `beb whoami > bob.pub` also works: it prints the public key
+on stdout, which is already the shape of a key file, and `authorize` will
+derive the same queue name from it.
 
 **On the depot**, one command per courier:
 
@@ -62,7 +72,16 @@ so that the fingerprint linking them is derived rather than typed twice.
 
 A recipient can be a key file, as above, or the queue name itself: 64 lowercase
 hex characters, being the 32 raw bytes of the identity's ed25519 key. Pass as
-many as the courier collects for. Later ones can be added with
+many as the courier collects for, which for a whole machine's worth is:
+
+```
+ls "${XDG_DATA_HOME:-$HOME/.local/share}/beb" | grep -E '^[0-9a-f]{64}$' |
+    xargs beb-depot authorize courier.pub
+```
+
+run wherever both the spool and the depot are in reach. Usually they are not,
+which is the reason the depot exists, so the more common form is to paste the
+list an operator was sent. Later ones can be added with
 `beb-depot allow <fingerprint> <recipient>`, or by re-running `authorize` with
 the fuller list, which adds only what is new.
 
