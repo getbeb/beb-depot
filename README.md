@@ -51,6 +51,10 @@ exactly who reads here, because sending to a stranger never invents a mailbox,
 and each appears at `beb init` rather than on first delivery, which is when you
 need it. For a single identity, `beb whoami > bob.pub` works too.
 
+This is shell trivia standing in for a command. `beb-courier whoami` will print
+the courier line and these queue names together, since both facts live on this
+machine and both are wanted on the other one.
+
 Send those lines, and `beb_courier.pub`, to whoever runs the depot.
 
 **On the depot**, which is a different machine and usually cannot reach back:
