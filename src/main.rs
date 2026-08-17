@@ -83,7 +83,7 @@ impl From<&str> for Fail {
 }
 
 const USAGE: &str = "\
-beb-depot holds beb mail for keys that read somewhere else.
+beb-depot {version} holds beb mail for keys that read somewhere else.
 
   beb-depot authorize KEYFILE [RECIPIENT...]
       let that courier in, and let it collect for those recipients
@@ -93,6 +93,8 @@ beb-depot holds beb mail for keys that read somewhere else.
       one more recipient for a courier already let in
   beb-depot held
       what is waiting, and for whom
+  beb-depot status
+      whether the lines sshd reads still describe this depot
 
   beb-depot --help
   beb-depot --version
@@ -130,8 +132,9 @@ fn main() -> ExitCode {
         Some("authorize") => cmd_authorize(&args[1..]),
         Some("allow") => cmd_allow(&args[1..]),
         Some("held") => cmd_held(&args[1..]),
+        Some("status") => cmd_status(&args[1..]),
         Some("--help") | Some("-h") | None => {
-            println!("{USAGE}");
+            println!("{}", USAGE.replace("{version}", env!("CARGO_PKG_VERSION")));
             return ExitCode::SUCCESS;
         }
         Some("--version") => {
@@ -1008,6 +1011,151 @@ fn oldest(root: &Path, mine: &[String]) -> Option<(String, u64, PathBuf)> {
 }
 
 // ---- held: what is waiting ---------------------------------------------
+
+/// Whether the lines sshd reads still describe this depot.
+///
+/// A depot is two facts that have to agree and are written in different
+/// places: the forced command in `authorized_keys`, and what is actually
+/// installed here. Both of this depot's outages were that pair drifting
+/// apart -- a line serving a root nobody had granted in, and elsewhere a
+/// unit resolving a binary four versions behind -- and in both cases
+/// every part looked healthy on its own. Nothing compared them, so
+/// answering "is this wired correctly" took six commands.
+///
+/// So this compares them, and reports what it cannot check rather than
+/// implying it did.
+fn cmd_status(args: &[String]) -> Result<(), Fail> {
+    if !args.is_empty() {
+        return Err("status takes nothing: beb-depot status".into());
+    }
+    let root = root()?;
+    let me = std::env::current_exe().ok();
+    let mut wrong = Vec::new();
+
+    let mode = fs::metadata(&root)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0);
+    if !root.is_dir() {
+        wrong.push(format!("{} is not there yet; nothing has been granted", root.display()));
+    } else if mode != DIR_MODE {
+        wrong.push(format!("{} is mode {mode:o}, and holds other people's mail", root.display()));
+    }
+
+    let text = fs::read_to_string(allowed_path(&root)).unwrap_or_default();
+    let grants: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut couriers: Vec<&str> = grants
+        .iter()
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    couriers.sort_unstable();
+    couriers.dedup();
+
+    // Every line sshd would run, taken apart the way sshd takes it apart.
+    let ak = authorized_keys_path()?;
+    let keys = fs::read_to_string(&ak).unwrap_or_default();
+    let mut lines = 0usize;
+    for (i, l) in keys.lines().enumerate() {
+        let Some(cmd) = l.split('"').nth(1) else { continue };
+        if !cmd.contains("serve") {
+            continue;
+        }
+        lines += 1;
+        let quoted: Vec<&str> = cmd.split('\'').skip(1).step_by(2).collect();
+        let bin = quoted.first().copied().unwrap_or_default();
+        let served = cmd
+            .split("--root")
+            .nth(1)
+            .and_then(|r| r.split('\'').nth(1))
+            .unwrap_or_default();
+        if !Path::new(bin).is_file() {
+            wrong.push(format!("line {} runs {bin}, which is not there", i + 1));
+        } else if me.as_deref().is_some_and(|m| m != Path::new(bin)) {
+            // Not fatal on its own -- status may be run from anywhere --
+            // but a second binary is how a stale one goes unnoticed.
+            wrong.push(format!(
+                "line {} runs {bin}, and this is {}",
+                i + 1,
+                me.as_ref().expect("checked").display()
+            ));
+        }
+        // Canonical both sides: authorize writes the resolved path, and
+        // on macOS /var is a symlink to /private/var, so the same
+        // directory spelled two ways would read as drift and make this
+        // whole verb noise.
+        let same = fs::canonicalize(served)
+            .ok()
+            .zip(fs::canonicalize(&root).ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or_else(|| Path::new(served) == root);
+        if !served.is_empty() && !same {
+            wrong.push(format!(
+                "line {} serves --root {served}, but the grants are in {}",
+                i + 1,
+                root.display()
+            ));
+        }
+        if served.is_empty() {
+            wrong.push(format!(
+                "line {} names no --root, so it serves whatever the environment says, and sshd passes none",
+                i + 1
+            ));
+        }
+    }
+    if lines == 0 {
+        wrong.push(format!(
+            "no line in {} runs this depot; authorize adds one",
+            util_pretty(&ak)
+        ));
+    }
+
+    let held: usize = fs::read_dir(root.join("inbox"))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_str().is_some_and(valid_recipient))
+                .map(|e| ids(&e.path()).len())
+                .sum()
+        })
+        .unwrap_or(0);
+
+    note(&format!(
+        "{} at {}, root {} ({mode:o})",
+        env!("CARGO_PKG_VERSION"),
+        me.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "?".into()),
+        root.display()
+    ));
+    note(&format!(
+        "{lines} {} in {}, {} couriers, {} grants, {held} waiting",
+        if lines == 1 { "line" } else { "lines" },
+        util_pretty(&ak),
+        couriers.len(),
+        grants.len()
+    ));
+    // sshd is the one thing this depends on and the one thing it does not
+    // own, so it is named rather than checked: a wrong answer about
+    // somebody else's service is worse than no answer.
+    note("sshd runs this on each connection; check it with your service manager");
+
+    if wrong.is_empty() {
+        return Ok(());
+    }
+    for w in &wrong {
+        note(w);
+    }
+    Err(refused(if wrong.len() == 1 {
+        "one thing does not agree".to_string()
+    } else {
+        format!("{} things do not agree", wrong.len())
+    }))
+}
+
+fn util_pretty(p: &Path) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && p.starts_with(&h) => {
+            format!("~{}", p.display().to_string().trim_start_matches(&h))
+        }
+        _ => p.display().to_string(),
+    }
+}
 
 fn cmd_held(args: &[String]) -> Result<(), Fail> {
     if !args.is_empty() {

@@ -223,6 +223,48 @@ ok "a key already in there under another fingerprint is refused, with the line n
 sed -i.bak "s|serve $FP1|serve $FP2|2" "$BEB_DEPOT_AUTHORIZED_KEYS"
 rm -f "$BEB_DEPOT_AUTHORIZED_KEYS".bak
 
+# ---- status ------------------------------------------------------------
+#
+# The two outages this depot had were the forced command and the install
+# drifting apart, and every part looked healthy alone. Nothing compared
+# them, so "is this wired correctly" took six commands.
+#
+# Its own root and its own authorized_keys: the file above has a
+# hand-made line in it from the mismatch test, which status is right to
+# object to and which would make every assertion here about that.
+edit() { python3 -c 'import sys,re,pathlib
+p=pathlib.Path(sys.argv[1]); p.write_text(re.sub(sys.argv[2], sys.argv[3], p.read_text()))' "$@"; }
+
+(
+    export BEB_DEPOT_ROOT=$W/st BEB_DEPOT_AUTHORIZED_KEYS=$W/st.ak
+    ssh-keygen -q -t ed25519 -N '' -C st -f "$W/st.key" || die "ssh-keygen"
+    "$DEPOT" authorize "$W/st.key.pub" "$KEY1" >/dev/null 2>&1 || die "authorize for status"
+
+    d status || die "status on a healthy depot: $(cat "$ERR")"
+    grep -q "root $W/st" "$ERR" || die "status names no root: $(cat "$ERR")"
+    grep -q '1 courier' "$ERR" || die "status counts no couriers: $(cat "$ERR")"
+    grep -q 'sshd runs this' "$ERR" || die "status does not say who runs it"
+    ok "status reports the depot and agrees with itself when nothing has drifted"
+
+    cp "$W/st.ak" "$W/st.keep"
+    edit "$W/st.ak" "--root '[^']*'" "--root '/srv/elsewhere'"
+    d status && die "status passed a line serving a root nobody granted in"
+    grep -q 'but the grants are in' "$ERR" || die "root drift unreported: $(cat "$ERR")"
+    ok "a line serving one root while the grants live in another is caught"
+
+    cp "$W/st.keep" "$W/st.ak"
+    printf 'command="/nonexistent/beb-depot serve --root %s SHA256:zz",restrict ssh-ed25519 AAAA x\n' \
+        "$W/st" >> "$W/st.ak"
+    d status && die "status passed a line running a binary that is not there"
+    grep -q 'which is not there' "$ERR" || die "missing binary unreported: $(cat "$ERR")"
+    ok "a line running a binary that does not exist is caught"
+
+    cp "$W/st.keep" "$W/st.ak"
+    d status || die "status after restoring: $(cat "$ERR")"
+    ok "and it goes quiet again once the lines match the install"
+) || exit 1
+n=$((n + 4))
+
 # ---- serve: what it will and will not answer ---------------------------
 
 serve "" "$A" && die "an empty intent was served"

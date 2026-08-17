@@ -128,6 +128,33 @@ That fingerprint is the depot's whole notion of who is calling, which
 is why authorize derives it from the key file rather than asking.
 ```
 
+## Is it wired correctly
+
+There is nothing to start or enable: sshd runs the depot per connection
+and it exits with the connection. So `status` reports whether the lines
+sshd reads still describe this install, rather than whether a daemon is
+up.
+
+```console
+$ beb-depot status
+beb-depot: 0.1.4 at /usr/local/bin/beb-depot, root /home/beb/.local/share/beb-depot (700)
+beb-depot: 4 lines in ~/.ssh/authorized_keys, 4 couriers, 6 grants, 0 waiting
+beb-depot: sshd runs this on each connection; check it with your service manager
+```
+
+It compares what the forced command says against what is installed, and
+exits 3 when they disagree:
+
+```console
+$ beb-depot status
+beb-depot: line 2 runs /home/op/src/beb-depot/target/release/beb-depot, and this is /usr/local/bin/beb-depot
+beb-depot: line 3 serves --root /srv/old, but the grants are in /home/beb/.local/share/beb-depot
+beb-depot: 2 things do not agree
+```
+
+Both of this depot's outages were that pair drifting apart, and every
+part looked healthy on its own.
+
 ## The wire
 
 `serve` answers three intents and refuses everything else:
