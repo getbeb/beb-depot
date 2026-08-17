@@ -23,10 +23,16 @@ On the machine that holds the mail, as an unprivileged account of its
 own:
 
 ```sh
+curl -fsSL https://getbeb.dev/depot.sh | sh
+```
+
+Or from source with cargo (Rust 1.75+):
+
+```sh
 cargo install --git https://github.com/getbeb/beb-depot
 ```
 
-Install before authorizing, and from where it will stay. `authorize`
+Install before authorizing, and to where it will stay. `authorize`
 writes the binary's own absolute path into the sshd line, so a depot
 authorized out of a build directory points there forever.
 
