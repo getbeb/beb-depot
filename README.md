@@ -37,9 +37,19 @@ unit file: every connection is one sshd child that exits.
 ssh-keygen -t ed25519 -C courier@laptop -f ~/.ssh/beb_courier
 ```
 
-Then say which identities that machine reads for. beb names each mailbox for
-the identity's key, so the spool already holds the answer, and the answer is
-already in the form the depot wants:
+Then say which identities that machine reads for.
+[beb-courier](https://github.com/getbeb/beb-courier) prints both facts as one
+file, since both live on this machine and both are wanted on the other one:
+
+```
+$ beb-courier whoami > laptop.handover
+beb-courier: 1 key, 2 queues this machine reads for
+beb-courier: give this to whoever runs the depot: beb-depot authorize <this file>
+```
+
+Without a courier installed, the same two facts by hand: the key is
+`beb_courier.pub`, and the queue names are the mailbox directories in beb's
+spool, since beb names each one for the identity's key.
 
 ```
 $ ls "${XDG_DATA_HOME:-$HOME/.local/share}/beb" | grep -E '^[0-9a-f]{64}$'
@@ -48,19 +58,14 @@ bb68ed0016fd16b5b04cd295b0433c3a54e15f34dcf898ca248dfb34dfa446f0
 
 The filter is not cosmetic: `outbox` sits beside the mailboxes. What is left is
 exactly who reads here, because sending to a stranger never invents a mailbox,
-and each appears at `beb init` rather than on first delivery, which is when you
-need it. For a single identity, `beb whoami > bob.pub` works too.
+and each appears at `beb init` rather than on first delivery.
 
-This is shell trivia standing in for a command. `beb-courier whoami` will print
-the courier line and these queue names together, since both facts live on this
-machine and both are wanted on the other one.
-
-Send those lines, and `beb_courier.pub`, to whoever runs the depot.
+Send that file, or those two things, to whoever runs the depot.
 
 **On the depot**, which is a different machine and usually cannot reach back:
 
 ```
-$ beb-depot authorize courier.pub bob.pub
+$ beb-depot authorize laptop.handover
 command="'/usr/local/bin/beb-depot' serve --root '/home/beb/.local/share/beb-depot' SHA256:yIemYIIM…",restrict ssh-ed25519 AAAA… courier@laptop
 beb-depot: added SHA256:yIemYIIM… to /home/beb/.ssh/authorized_keys
 beb-depot: SHA256:yIemYIIM… may now collect for 640452f4b6c5d6ca…c90169
@@ -68,8 +73,9 @@ beb-depot: sshd needs no reload; it reads authorized_keys on each connection
 ```
 
 That is the whole of it. The courier key goes into `authorized_keys` behind a
-forced command, and the grant goes into the depot's `allowed` file, in one act
-so that the fingerprint linking them is derived rather than typed twice.
+forced command, and the grants go into the depot's `allowed` file, in one act
+so that the fingerprint linking them is derived rather than typed twice. A
+handover file names its own recipients; a bare `.pub` takes them as arguments.
 
 A recipient is either a key file, as above, or the queue name itself: 64
 lowercase hex characters, being the 32 raw bytes of the identity's ed25519 key.
@@ -107,7 +113,8 @@ Inbound holds a connection open, because a depot cannot dial a client that is
 behind NAT:
 
 ```sh
-ssh depot pickup
+ssh depot pickup     # stream, then block when empty
+ssh depot drain      # stream, then return when empty
 ```
 
 which streams `<recipient> <id> <bytes>` and then exactly that many bytes, over
@@ -116,8 +123,9 @@ to `beb drop`, and reply `ack <id>` once beb has taken it. Nothing is deleted
 before the ack, so a courier that dies mid-transfer loses nothing, and the beb
 on the far end deduplicates whatever it is handed twice.
 
-Both halves are what [beb-courier](https://github.com/getbeb/beb-courier) will
-do. Until it exists, the loops above are enough.
+Both halves are what [beb-courier](https://github.com/getbeb/beb-courier) does:
+`beb-courier sync` is the two loops above, and `beb-courier listen` is the
+second one held open.
 
 ## Looking at it
 

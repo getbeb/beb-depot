@@ -86,7 +86,9 @@ ssh-keygen -q -t ed25519 -N '' -C courier2 -f "$W/c2" || die "ssh-keygen"
 FP1=$(ssh-keygen -lf "$W/c1.pub" | awk '{print $2}')
 
 d authorize "$W/c1.pub" && die "authorize with no recipient succeeded"
-grep -q 'at least one recipient' "$ERR" || die "arity refusal: $(cat "$ERR")"
+grep -q 'names no recipients, and none were given' "$ERR" ||
+    die "arity refusal: $(cat "$ERR")"
+grep -q 'beb-courier whoami' "$ERR" || die "the refusal does not name the file that carries them"
 d authorize "$W/c1.pub" "not-a-key" && die "a bad recipient was authorized"
 test -e "$BEB_DEPOT_AUTHORIZED_KEYS" && die "a refused authorize wrote the key in anyway"
 ok "authorize checks every recipient before it writes anything"
@@ -195,10 +197,10 @@ rm -f "$BEB_DEPOT_AUTHORIZED_KEYS".bak
 # ---- serve: what it will and will not answer ---------------------------
 
 serve "" "$A" && die "an empty intent was served"
-grep -q 'drop <recipient> or pickup' "$ERR" || die "empty intent refusal: $(cat "$ERR")"
+grep -q 'drop <recipient>, pickup, or drain' "$ERR" || die "empty intent refusal: $(cat "$ERR")"
 serve "rm -rf /" "$A" && die "an arbitrary command was served"
 grep -q 'nothing else is served here' "$ERR" || die "arbitrary intent refusal: $(cat "$ERR")"
-ok "serve answers two intents and refuses everything else"
+ok "serve answers the intents it has and refuses everything else"
 
 "$DEPOT" serve "not-a-fingerprint" >"$OUT" 2>"$ERR" && die "serve took a bad fingerprint"
 ok "serve refuses a fingerprint sshd would never have given it"
@@ -284,6 +286,41 @@ assert os.path.exists(os.path.join(root, "inbox", to, "%018d" % int(i))), \
     "a frame vanished when the courier died"
 PY
 ok "a courier that dies mid-transfer leaves the frame where it was"
+
+# ---- drain -------------------------------------------------------------
+
+# The one thing that must be true of it: an empty queue ends the call
+# rather than holding it. A courier run at a turn boundary has to finish.
+serve "drain" "$B" ; rc=$?
+test "$rc" -eq 3 || die "drain for a courier with no grant exited $rc, wanted 3"
+# Its own fingerprint and its own queue, so that mail left by the tests
+# above cannot decide what this one sees.
+DR="SHA256:cccc2222222222222222222222222222222222222222"
+d allow "$DR" "$KEY3" || die "allow for the drain test: $(cat "$ERR")"
+SSH_ORIGINAL_COMMAND=drain timeout 5 "$DEPOT" serve "$DR" </dev/null >"$OUT" 2>"$ERR"; rc=$?
+test "$rc" -ne 124 || die "drain blocked on an empty queue instead of returning"
+test "$rc" -eq 0 || die "drain on an empty queue exited $rc, wanted 0"
+test -s "$OUT" && die "drain wrote something with nothing to hand over"
+ok "drain returns on an empty queue, where pickup would wait"
+
+printf 'for draining' >"$W/f3"
+serve "drop $KEY3" "$A" "$W/f3" || die "drop for the drain test: $(cat "$ERR")"
+python3 - "$DEPOT" "$DR" "$W" <<'PY2' || die "drain hands frames over"
+import os, subprocess, sys
+depot, fp, w = sys.argv[1:]
+env = dict(os.environ, SSH_ORIGINAL_COMMAND="drain")
+p = subprocess.Popen([depot, "serve", fp], env=env, stdin=subprocess.PIPE,
+                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+to, i, n = p.stdout.readline().decode().split()
+assert p.stdout.read(int(n)) == open(w + "/f3", "rb").read()
+p.stdin.write(("ack %s\n" % i).encode()); p.stdin.flush()
+# Nothing else is waiting, so it must end rather than block.
+assert p.stdout.readline() == b"", "drain kept the connection after the last frame"
+assert p.wait(timeout=10) == 0
+held = os.path.join(os.environ["BEB_DEPOT_ROOT"], "inbox", to, "%018d" % int(i))
+assert not os.path.exists(held), "the acked frame is still held"
+PY2
+ok "drain streams what is there, waits for each ack, and then ends the call"
 
 # ---- limits ------------------------------------------------------------
 

@@ -85,7 +85,7 @@ impl From<&str> for Fail {
 const USAGE: &str = "\
 beb-depot holds beb mail for keys that read somewhere else.
 
-  beb-depot authorize KEYFILE RECIPIENT...
+  beb-depot authorize KEYFILE [RECIPIENT...]
       let that courier in, and let it collect for those recipients
   beb-depot serve [--root PATH] FINGERPRINT
       answer one connection; sshd runs this as a forced command
@@ -99,7 +99,9 @@ beb-depot holds beb mail for keys that read somewhere else.
 
 A RECIPIENT is a queue name, 64 lowercase hex, or the path to a beb
 identity's public key file, which this converts to one. A KEYFILE is a
-courier's public key; its fingerprint is derived, never typed.
+courier's public key; its fingerprint is derived, never typed. If it is
+what beb-courier whoami printed, it names its own recipients and you
+need give none.
 
 Exit: 0 did it, 1 change the command, 2 nothing to do, 3 refused.
 
@@ -301,21 +303,40 @@ fn authorized_keys_path() -> Result<PathBuf, String> {
 /// never transcribes it. What is left for a human is the decision --
 /// this key, these recipients -- which is the part a human should have.
 fn cmd_authorize(args: &[String]) -> Result<(), Fail> {
-    let (keyfile, recipients) = match args {
-        [k, rest @ ..] if !rest.is_empty() => (Path::new(k.as_str()), rest),
+    let (keyfile, given) = match args {
+        [k, rest @ ..] => (Path::new(k.as_str()), rest),
         _ => {
-            return Err("authorize takes a public key file and at least one recipient: \
-                        beb-depot authorize KEYFILE RECIPIENT..."
+            return Err("authorize takes a courier's key file, and the recipients it \
+                        collects for: beb-depot authorize KEYFILE [RECIPIENT...]"
                 .into())
         }
     };
+    // A handover file carries both: beb-courier whoami prints the key
+    // first and the queue names after it, so that the two facts travel
+    // together to a machine the courier was built to be unable to reach.
+    // Naming recipients on the command line still works, and adds to
+    // whatever the file already said.
+    let carried = carried_recipients(keyfile)?;
+    if given.is_empty() && carried.is_empty() {
+        return Err(refused(format!(
+            "{} names no recipients, and none were given\n\
+             beb-courier whoami prints a file that carries them, or name them here",
+            keyfile.display()
+        )));
+    }
+    let recipients: Vec<String> = given.to_vec();
     // Everything is resolved before anything is written: a half-authorized
     // courier is a key that can connect and collect nothing, which looks
     // like a depot fault rather than a typo.
-    let recipients: Vec<String> = recipients
+    let mut recipients: Vec<String> = recipients
         .iter()
         .map(|r| as_recipient(r))
         .collect::<Result<_, _>>()?;
+    for c in carried {
+        if !recipients.contains(&c) {
+            recipients.push(c);
+        }
+    }
     let key = read_public_key(keyfile)?;
     let fp = fingerprint_of(keyfile)?;
     let exe = shell_word(&forced_command_binary()?)?;
@@ -462,6 +483,19 @@ fn ssh_string(b: &[u8], at: usize) -> Option<(&[u8], usize)> {
     Some((b.get(s..e)?, e))
 }
 
+/// Queue names sitting in the key file, if it is a handover rather than
+/// a bare `.pub`. Lines that are 64 hex characters and nothing else.
+fn carried_recipients(p: &Path) -> Result<Vec<String>, Fail> {
+    let text = fs::read_to_string(p)
+        .map_err(|e| Fail::from(format!("cannot read {}: {e}", p.display())))?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| valid_recipient(l))
+        .map(str::to_string)
+        .collect())
+}
+
 /// The one key in a public key file, or a refusal saying which it was.
 fn read_public_key(p: &Path) -> Result<String, Fail> {
     let text = fs::read_to_string(p)
@@ -475,7 +509,7 @@ fn read_public_key(p: &Path) -> Result<String, Fail> {
     let keys: Vec<&str> = text
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !valid_recipient(l))
         .collect();
     let key = match keys.as_slice() {
         [one] => *one,
@@ -630,9 +664,10 @@ fn cmd_serve(args: &[String]) -> Result<(), Fail> {
     let mut words = asked.split_whitespace();
     match (words.next(), words.next(), words.next()) {
         (Some("drop"), Some(to), None) => do_drop(&root, fp, to),
-        (Some("pickup"), None, None) => do_pickup(&root, fp),
+        (Some("pickup"), None, None) => do_pickup(&root, fp, true),
+        (Some("drain"), None, None) => do_pickup(&root, fp, false),
         _ => Err(refused(
-            "say drop <recipient> or pickup; nothing else is served here",
+            "say drop <recipient>, pickup, or drain; nothing else is served here",
         )),
     }
 }
@@ -755,7 +790,13 @@ fn next_id(dir: &Path) -> Result<u64, String> {
 /// connection that dies mid-stream leaves it here and the next
 /// collection offers it again, which is safe because the beb receiving
 /// it deduplicates.
-fn do_pickup(root: &Path, fp: &str) -> Result<(), Fail> {
+/// `wait` is the whole difference between the two collecting intents.
+///
+/// A courier run at a turn boundary has to finish, and a courier holding
+/// a connection open has to not. Both want every frame that is here;
+/// they disagree only about an empty queue, so they are one function and
+/// one flag rather than two paths that could drift.
+fn do_pickup(root: &Path, fp: &str, wait: bool) -> Result<(), Fail> {
     let mine = allowed_for(root, fp);
     if mine.is_empty() {
         return Err(refused(format!(
@@ -773,6 +814,7 @@ fn do_pickup(root: &Path, fp: &str) -> Result<(), Fail> {
     let mut input = io::stdin().lock();
     loop {
         match oldest(root, &mine) {
+            None if !wait => return Ok(()),
             None => {
                 if !peer_present(POLL) {
                     // Not a failure and not a refusal: a courier that

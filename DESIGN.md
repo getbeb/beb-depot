@@ -80,13 +80,18 @@ Two intents:
 
     drop <recipient>     read one frame from stdin, file it under
                          inbox/<recipient>/
-    pickup               block until something is waiting for a key
-                         this courier is allowed to collect; stream it;
-                         wait for an ack; delete
+    pickup               stream every frame waiting for a key this
+                         courier may collect, waiting for an ack after
+                         each; when there are none, block
+    drain                the same, but when there are none, return
 
 `pickup` blocks because that is the only way an unreachable client
 learns anything: it holds the connection open and the depot answers
 inside it. One-way ssh is one-way about who *initiates*.
+
+`drain` exists because a courier run at a turn boundary has to finish.
+The two differ in nothing but an empty queue, so they are one code path
+and one flag rather than two that could drift.
 
 What it blocks on is the client as much as the directory. sshd does
 not signal a forced command when its connection closes, so a `pickup`
@@ -101,10 +106,16 @@ left has done nothing wrong, so that exit is a 0.
 
 A courier collects for a recipient because an operator said so:
 
-    beb-depot authorize courier.pub bob.pub
+    beb-depot authorize laptop.handover
 
 One act: the key goes into `authorized_keys` behind the right forced
-command, and the grant goes into `allowed`.
+command, and the grants go into `allowed`.
+
+That file is what `beb-courier whoami` prints -- a public key, then the
+queue names that machine reads for. Both facts have to cross to a
+machine the courier was built to be unable to reach, so they cross
+together, and the operator names neither. A bare `.pub` with the
+recipients as arguments works the same way.
 
 Both arguments are key files, and neither is transcribed. The courier's
 fingerprint comes from `ssh-keygen -lf`; the recipient's queue name is
