@@ -624,8 +624,17 @@ fn shell_word(s: &str) -> Result<String, Fail> {
 /// losing whatever arrived in between, and this verb's whole purpose is
 /// to be the safe way to touch it.
 fn append_line(p: &Path, line: &str) -> Result<(), Fail> {
+    // Created if missing, and never chmodded if not. The parent here is
+    // somebody else's directory -- ~/.ssh, or a home -- unlike every
+    // other directory this program makes. Setting 700 on one that
+    // already existed changed the mode of a depot account's home the
+    // first time it was pointed anywhere but ~/.ssh, and would have
+    // tried it on /tmp.
     if let Some(d) = p.parent() {
-        private_dir_all(d).map_err(|e| Fail::from(format!("cannot create {}: {e}", d.display())))?;
+        if !d.as_os_str().is_empty() && !d.is_dir() {
+            private_dir_all(d)
+                .map_err(|e| Fail::from(format!("cannot create {}: {e}", d.display())))?;
+        }
     }
     let mut f = OpenOptions::new()
         .create(true)

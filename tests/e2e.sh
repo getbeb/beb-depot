@@ -156,6 +156,18 @@ grep -qF "$(cat "$W/c1.pub" | awk '{print $2}')" "$BEB_DEPOT_AUTHORIZED_KEYS" ||
 test "$(grep -c "$FP1" "$BEB_DEPOT_ROOT/allowed")" -eq 2 || die "both grants were not written"
 ok "authorize writes the sshd line and both grants in one act"
 
+# The parent of authorized_keys belongs to whoever owns the account, not
+# to this program: it may create one, but it may not restyle one it
+# found. It set a depot account's home to 700 before this was here.
+mkdir -p "$W/theirs"; chmod 755 "$W/theirs"
+BEB_DEPOT_AUTHORIZED_KEYS=$W/theirs/keys d authorize "$W/c1.pub" "$KEY1" >/dev/null 2>&1
+# GNU stat first: its -f means "filesystem status" and would succeed
+# with something that is not a mode at all.
+mode=$(stat -c '%a' "$W/theirs" 2>/dev/null || stat -f '%Lp' "$W/theirs")
+test "$mode" = "755" || die "authorize changed a directory it did not create to $mode"
+test -s "$W/theirs/keys" || die "it did not write the line it was asked for"
+ok "a directory that already existed keeps its mode; only a new one is made private"
+
 # The fingerprint nobody typed: it must be the one ssh-keygen computes.
 grep -qF "$FP1" "$BEB_DEPOT_AUTHORIZED_KEYS" || die "the written fingerprint is not ssh-keygen's"
 ok "the fingerprint in the line is derived, never transcribed"
