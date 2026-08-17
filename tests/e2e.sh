@@ -117,6 +117,16 @@ grep -q "may now collect for $BOBHEX" "$ERR" || die "derived the wrong queue: $(
 grep -qF "$BOBHEX" "$BEB_DEPOT_ROOT/allowed" || die "the derived grant is not in allowed"
 ok "a recipient may be a public key file, and the queue name is derived from it"
 
+# A handover always comes from a machine the depot cannot reach, so the
+# path it is given is often a pipe. That works only if the file is read
+# once: twice and the second read sees an empty stream.
+ssh-keygen -q -t ed25519 -N '' -C piped -f "$W/p3" || die "ssh-keygen"
+FP3=$(ssh-keygen -lf "$W/p3.pub" | awk '{print $2}')
+{ cat "$W/p3.pub"; echo "$KEY3"; } | d authorize /dev/stdin || die "piped: $(cat "$ERR")"
+grep -qF "$FP3" "$BEB_DEPOT_AUTHORIZED_KEYS" || die "the piped key is not in authorized_keys"
+grep -q "$FP3 $KEY3" "$BEB_DEPOT_ROOT/allowed" || die "the piped grant is missing"
+ok "a handover may arrive on a pipe, so the depot side is one ssh and no temp file"
+
 ssh-keygen -q -t rsa -b 2048 -N '' -C rsa -f "$W/r" >/dev/null 2>&1 || die "ssh-keygen rsa"
 d authorize "$W/c1.pub" "$W/r.pub" && die "an rsa key was accepted as a recipient"
 grep -q 'is ed25519' "$ERR" || die "rsa refusal: $(cat "$ERR")"

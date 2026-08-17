@@ -71,6 +71,14 @@ The filter matters: `outbox` sits beside the mailboxes. Add recipients
 later with `beb-depot allow`, or re-run `authorize`, which adds only
 what is new.
 
+A handover is read once, so the path can be a pipe. Where the depot
+account is reached through another login, that is the whole of its
+side, with nothing left behind to clean up:
+
+```sh
+ssh depot "su -s /bin/sh beb -c 'beb-depot authorize /dev/stdin'" < alice.handover
+```
+
 ## Commands
 
 ```console

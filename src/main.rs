@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, ErrorKind, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 const DIR_MODE: u32 = 0o700;
@@ -316,7 +316,8 @@ fn cmd_authorize(args: &[String]) -> Result<(), Fail> {
     // together to a machine the courier was built to be unable to reach.
     // Naming recipients on the command line still works, and adds to
     // whatever the file already said.
-    let carried = carried_recipients(keyfile)?;
+    let handover = read_handover(keyfile)?;
+    let carried = handover.recipients;
     if given.is_empty() && carried.is_empty() {
         return Err(refused(format!(
             "{} names no recipients, and none were given\n\
@@ -337,8 +338,8 @@ fn cmd_authorize(args: &[String]) -> Result<(), Fail> {
             recipients.push(c);
         }
     }
-    let key = read_public_key(keyfile)?;
-    let fp = fingerprint_of(keyfile)?;
+    let key = handover.key;
+    let fp = fingerprint_of(keyfile, &key)?;
     let exe = shell_word(&forced_command_binary()?)?;
     // Resolved now, absolute, and written into the line: whatever root
     // this operator is granting in is the root the connection will serve
@@ -431,7 +432,7 @@ fn as_recipient(arg: &str) -> Result<String, Fail> {
 /// Derived the same way beb names the mailbox -- the second string of
 /// the ssh wire encoding, which for ed25519 is exactly the 32 bytes.
 fn recipient_of(p: &Path) -> Result<String, Fail> {
-    let key = read_public_key(p)?;
+    let key = read_handover(p)?.key;
     let mut f = key.split_whitespace();
     let kind = f.next().unwrap_or_default().to_string();
     let blob = f.next().unwrap_or_default();
@@ -483,21 +484,21 @@ fn ssh_string(b: &[u8], at: usize) -> Option<(&[u8], usize)> {
     Some((b.get(s..e)?, e))
 }
 
-/// Queue names sitting in the key file, if it is a handover rather than
-/// a bare `.pub`. Lines that are 64 hex characters and nothing else.
-fn carried_recipients(p: &Path) -> Result<Vec<String>, Fail> {
-    let text = fs::read_to_string(p)
-        .map_err(|e| Fail::from(format!("cannot read {}: {e}", p.display())))?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|l| valid_recipient(l))
-        .map(str::to_string)
-        .collect())
+/// A courier's key and the queues it collects for, from one read.
+///
+/// One read and not two, so the path may be a pipe. `beb-depot
+/// authorize /dev/stdin` is then the whole of the depot's side, which
+/// matters because a handover always arrives from a machine the depot
+/// cannot reach: the alternative is a copy, a chown, and a leftover
+/// file to remember to remove.
+///
+/// A bare `.pub` is the same thing with no queue names in it.
+struct Handover {
+    key: String,
+    recipients: Vec<String>,
 }
 
-/// The one key in a public key file, or a refusal saying which it was.
-fn read_public_key(p: &Path) -> Result<String, Fail> {
+fn read_handover(p: &Path) -> Result<Handover, Fail> {
     let text = fs::read_to_string(p)
         .map_err(|e| Fail::from(format!("cannot read {}: {e}", p.display())))?;
     if text.contains("PRIVATE KEY") {
@@ -506,11 +507,18 @@ fn read_public_key(p: &Path) -> Result<String, Fail> {
             p.display()
         )));
     }
-    let keys: Vec<&str> = text
+    let (mut keys, mut recipients) = (Vec::new(), Vec::new());
+    for l in text
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#') && !valid_recipient(l))
-        .collect();
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        if valid_recipient(l) {
+            recipients.push(l.to_string());
+        } else {
+            keys.push(l);
+        }
+    }
     let key = match keys.as_slice() {
         [one] => *one,
         [] => return Err(refused(format!("{} holds no key", p.display()))),
@@ -530,17 +538,33 @@ fn read_public_key(p: &Path) -> Result<String, Fail> {
             p.display()
         )));
     }
-    Ok(key.to_string())
+    Ok(Handover { key: key.to_string(), recipients })
 }
 
 /// ssh-keygen's answer, not ours. Computing a fingerprint here would
 /// mean owning a second opinion about what sshd will compute, and the
 /// only opinion that matters is sshd's.
-fn fingerprint_of(p: &Path) -> Result<String, Fail> {
-    let out = std::process::Command::new("ssh-keygen")
+fn fingerprint_of(p: &Path, key: &str) -> Result<String, Fail> {
+    // The key text, not the path: the path may have been a pipe, and a
+    // pipe read twice is empty the second time. ssh-keygen takes "-" for
+    // stdin, so it still computes the fingerprint rather than this doing
+    // it, which keeps the one opinion that matters sshd's.
+    let mut child = std::process::Command::new("ssh-keygen")
         .arg("-lf")
-        .arg(p)
-        .output()
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Fail::from(format!("cannot run ssh-keygen: {e}")))?;
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(format!("{key}\n").as_bytes())
+        .map_err(|e| format!("cannot write to ssh-keygen: {e}"))?;
+    let out = child
+        .wait_with_output()
         .map_err(|e| Fail::from(format!("cannot run ssh-keygen: {e}")))?;
     if !out.status.success() {
         return Err(refused(format!(
