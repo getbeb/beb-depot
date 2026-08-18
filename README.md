@@ -5,10 +5,19 @@ machines cannot reach each other, both connect outbound to a depot,
 which holds their mail until the recipient's courier collects it.
 
 ```
-machine A ──outbound ssh──▶ depot ◀──outbound ssh── machine B
-                              │
-                         holds mail by recipient
+beb          signs, stores and reads mail on one machine
+beb-courier  carries it between machines
+beb-depot    holds it when two machines cannot reach each other
 
+identity ─ beb ─ courier ─────── courier ─ beb ─ identity
+                         \     /
+                          depot
+                        (optional)
+```
+
+Both machines connect outbound to the depot; it connects to nobody.
+
+```
 authorize   this courier may connect
 grant       this courier may collect for one recipient
 register    the courier asks for its own grant, signed
@@ -45,7 +54,7 @@ A courier hands you one file, printed by
 ```console
 # on the depot
 $ beb-depot authorize laptop.handover
-command="'/usr/local/bin/beb-depot' serve --root '/home/beb/.local/share/beb-depot' SHA256:yIemYIIM…",restrict ssh-ed25519 AAAA… courier@laptop
+command="'/usr/local/bin/beb-depot' serve --root '…' SHA256:yIemYIIM…",restrict ssh-ed25519 AAAA…
 beb-depot: added SHA256:yIemYIIM… to /home/beb/.ssh/authorized_keys
 beb-depot: sshd needs no reload; it reads authorized_keys on each connection
 beb-depot: it collects for nothing yet: beb-depot grant SHA256:yIemYIIM… <recipient>
@@ -159,7 +168,7 @@ beb-depot: line 3 serves --root /srv/old, but the grants are in /home/beb/.local
 beb-depot: 2 things do not agree
 ```
 
-Both of this depot's outages were that pair drifting apart.
+In production, both outages we have seen were that pair drifting apart.
 
 ## The wire
 
