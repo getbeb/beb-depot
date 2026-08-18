@@ -1,21 +1,21 @@
 # beb-depot
 
-Where [beb](https://github.com/getbeb/beb) mail waits when two machines
-cannot reach each other.
+A relay store for [beb](https://github.com/getbeb/beb). When two
+machines cannot reach each other, both connect outbound to a depot,
+which holds their mail until the recipient's courier collects it.
 
-Clients can reach a hub; the hub can reach nobody. NAT, firewalls,
-laptops that sleep. The depot is the one address everybody can reach:
-it holds signed frames for keys that read somewhere else and hands them
-over when their owner asks.
+```
+machine A ──outbound ssh──▶ depot ◀──outbound ssh── machine B
+                              │
+                         holds mail by recipient
 
-```console
-$ beb-depot held
-beb-depot: 1 recipients with mail in ~/.local/share/beb-depot
-640452f4b6c5d6ca49950c2c7611b6a37ea908c8a16f59ace0e3bb6a75c90169  3  1704
+authorize   this courier may connect
+grant       this courier may collect for one recipient
+register    the courier asks for its own grant, signed
 ```
 
-It runs no beb, parses no frame, and verifies no signature. sshd
-decides who is calling; this decides where the bytes go.
+It runs no beb and never inspects message contents. sshd decides who is
+calling; this decides where the bytes go.
 
 ## Install
 
@@ -32,12 +32,10 @@ Or from source with cargo (Rust 1.75+):
 cargo install --git https://github.com/getbeb/beb-depot
 ```
 
-Install before authorizing, and to where it will stay. `authorize`
-writes the binary's own absolute path into the sshd line, so a depot
-authorized out of a build directory points there forever.
+Install before authorizing, and to where it will stay: `authorize`
+writes the binary's own absolute path into the sshd line.
 
-It needs an sshd and nothing else. No daemon, no port, no unit: every
-connection is one sshd child that exits.
+It needs an sshd and nothing else. No daemon, no port, no unit.
 
 ## Quick start
 
@@ -45,87 +43,96 @@ A courier hands you one file, printed by
 [beb-courier](https://github.com/getbeb/beb-courier) on the client:
 
 ```console
+# on the depot
 $ beb-depot authorize laptop.handover
 command="'/usr/local/bin/beb-depot' serve --root '/home/beb/.local/share/beb-depot' SHA256:yIemYIIM…",restrict ssh-ed25519 AAAA… courier@laptop
 beb-depot: added SHA256:yIemYIIM… to /home/beb/.ssh/authorized_keys
-beb-depot: SHA256:yIemYIIM… may now collect for 640452f4b6c5d6ca…c90169
 beb-depot: sshd needs no reload; it reads authorized_keys on each connection
+beb-depot: it collects for nothing yet: beb-depot grant SHA256:yIemYIIM… <recipient>
+beb-depot: or that machine says so itself, with beb-courier register
 ```
 
-That is the whole setup. The key goes into `authorized_keys` behind a
-forced command and the grants go into `allowed`, in one act, so the
-fingerprint linking them is derived rather than typed into two files
-that have to agree.
+That lets the machine connect, but it cannot collect anything yet. Each
+recipient queue is granted separately, and normally the client asks for
+its own: `register` sends a signed claim over the connection `authorize`
+just allowed, asking for the queue belonging to that identity.
 
-Without a courier, the same two facts by hand: a public key, and the
-queue names, which are the mailbox directories in beb's spool because
-beb names each one for the identity's key.
-
-```console
-$ ls "${XDG_DATA_HOME:-$HOME/.local/share}/beb" | grep -E '^[0-9a-f]{64}$'
-bb68ed0016fd16b5b04cd295b0433c3a54e15f34dcf898ca248dfb34dfa446f0
-$ beb-depot authorize courier.pub bb68ed00…f0
+```sh
+# on the client
+BEB_IDENTITY=~/newthing beb whoami | beb-courier register
 ```
 
-The filter matters: `outbox` sits beside the mailboxes. Add recipients
-later with `beb-depot allow`, or re-run `authorize`, which adds only
-what is new.
+Grant it here instead when the client cannot ask. The first argument
+identifies the courier, the second the recipient queue, and either can
+be a key file or `-` for a key on stdin, so nothing is typed:
 
-A handover is read once, so the path can be a pipe. Where the depot
-account is reached through another login, that is the whole of its
-side, with nothing left behind to clean up:
+```sh
+# on the depot
+ssh client 'BEB_IDENTITY=~/alice beb whoami' | beb-depot grant laptop.handover -
+```
+
+`authorize` reads the handover once, so it can come straight off a pipe.
+Use `-` rather than `/dev/stdin`, which `su` cannot re-open:
 
 ```sh
 ssh depot "su -s /bin/sh beb -c 'beb-depot authorize -'" < alice.handover
 ```
 
-`-` is the descriptor already open, not the path `/dev/stdin`. They
-differ exactly here: `su` changes uid, and re-opening `/dev/stdin`
-after that is a permission error on a pipe the first user owns.
-
 ## Commands
 
 ```console
 $ beb-depot
-beb-depot holds beb mail for keys that read somewhere else.
+beb-depot 0.2.0 stores beb mail until an authorized courier collects it.
 
-  beb-depot authorize KEYFILE [RECIPIENT...]
-      let that courier in, and let it collect for those recipients
-  beb-depot serve [--root PATH] FINGERPRINT
-      answer one connection; sshd runs this as a forced command
-  beb-depot allow FINGERPRINT RECIPIENT
-      one more recipient for a courier already let in
+Two permissions: who may connect, and which queues they may collect.
+authorize and unauthorize decide the first, grant and revoke the second.
+
+  beb-depot authorize KEYFILE
+      let a courier connect; KEYFILE is its public key, or - for stdin
+  beb-depot unauthorize COURIER
+      stop it connecting, and remove every queue grant it holds
+
+  beb-depot grant COURIER RECIPIENT
+      let a courier collect for one recipient queue
+  beb-depot revoke COURIER RECIPIENT
+      stop it collecting for that one
+
   beb-depot held
-      what is waiting, and for whom
+      queued mail, and the recipients it is waiting for
+  beb-depot status
+      whether this install still matches the authorized_keys entries
+  beb-depot serve [--root PATH] FINGERPRINT
+      serve one connection; sshd runs this, not you
 
   beb-depot --help
   beb-depot --version
 
-A RECIPIENT is a queue name, 64 lowercase hex, or the path to a beb
-identity's public key file, which this converts to one. A KEYFILE is a
-courier's public key; its fingerprint is derived, never typed. If it is
-what beb-courier whoami printed, it names its own recipients and you
-need give none.
+A courier normally asks for a queue itself, with beb-courier register,
+signed and sent over a connection authorize already allowed. Use grant
+when the recipient cannot ask.
+
+A COURIER is a fingerprint, or the key file it came from, or - for that
+key on stdin. A RECIPIENT is a 64-character lowercase hex id, or a beb
+identity's public key file, or - for that key on stdin. Given a key,
+either is derived from it, so nothing long is ever typed.
 
 Exit: 0 did it, 1 change the command, 2 nothing to do, 3 refused.
 
-It holds at most 64 MiB per frame, and per recipient 10000 frames or
-1 GiB, whichever comes first. Anything that has waited more than 30
-days is dropped, swept by whatever touches the queue next.
+A frame may be at most 64 MiB. A queue holds at most 10000 frames or
+1 GiB, and frames older than 30 days go when it is next used. None of
+those four is configurable.
 
-BEB_DEPOT_ROOT names where it keeps things. It defaults to
-~/.local/share/beb-depot, and holds:
+BEB_DEPOT_ROOT is the storage directory, ~/.local/share/beb-depot by
+default: one grant per line in allowed, and one frame per file under
+inbox/<recipient>/<id>.
 
-  allowed                    one "FINGERPRINT RECIPIENT" line each
-  inbox/<recipient>/<id>     one whole frame per file
-
-BEB_DEPOT_AUTHORIZED_KEYS names the file authorize writes. It defaults
-to ~/.ssh/authorized_keys, and gains one line per courier:
+BEB_DEPOT_AUTHORIZED_KEYS is the authorized_keys file authorize writes,
+~/.ssh/authorized_keys by default. Each entry looks like:
 
   command="'/path/to/beb-depot' serve --root '/path' SHA256:...",restrict ssh-...
 
-That fingerprint is the depot's whole notion of who is calling, which
-is why authorize derives it from the key file rather than asking.
+The fingerprint in it is who beb-depot takes the connection to be, which
+is why authorize needs the key and cannot take a fingerprint.
 ```
 
 ## Is it wired correctly
@@ -137,8 +144,8 @@ up.
 
 ```console
 $ beb-depot status
-beb-depot: 0.1.4 at /usr/local/bin/beb-depot, root /home/beb/.local/share/beb-depot (700)
-beb-depot: 4 lines in ~/.ssh/authorized_keys, 4 couriers, 6 grants, 0 waiting
+beb-depot: 0.2.0 at /usr/local/bin/beb-depot, root /home/beb/.local/share/beb-depot (700)
+beb-depot: 4 lines in ~/.ssh/authorized_keys, 4 may connect, 6 grants, 0 waiting
 beb-depot: sshd runs this on each connection; check it with your service manager
 ```
 
@@ -152,17 +159,19 @@ beb-depot: line 3 serves --root /srv/old, but the grants are in /home/beb/.local
 beb-depot: 2 things do not agree
 ```
 
-Both of this depot's outages were that pair drifting apart, and every
-part looked healthy on its own.
+Both of this depot's outages were that pair drifting apart.
 
 ## The wire
 
-`serve` answers three intents and refuses everything else:
+`serve` answers six intents and refuses everything else:
 
 ```sh
 ssh depot "drop <recipient>"   # one frame on stdin
 ssh depot pickup               # stream, then block when empty
 ssh depot drain                # stream, then return when empty
+ssh depot register             # a signed claim on stdin, verified here
+ssh depot "unregister <recipient>"
+ssh depot granted              # what this courier may collect for
 ```
 
 Collecting streams `<recipient> <id> <bytes>` and then exactly that
@@ -175,20 +184,20 @@ whatever it is handed twice.
 learns anything. `drain` exists because a run at a turn boundary has to
 finish.
 
+A `register` claim is an address, the fingerprint it authorises, and an
+sshsig over those two lines. The queue it grants is derived from the
+signed key, so a claim can only ever be about the identity that made it.
+`unregister` removes one, and carries no signature. `granted` is
+read-only and answers only about the caller.
+
 ## Design
 
-Storage is keyed by recipient, not by courier, so a drop is a write
-with no lookup and moving an identity to another machine moves no
-files. The caps and the 30 day expiry are constants rather than
-settings: a depot cannot tell a mistake from an attack, and an opinion
-every deployment states differently is not an opinion.
-
-What it trusts is sshd, and only sshd: that the fingerprint in its own
-command line names the key that authenticated. Everything else follows
-from that one fact.
+Storage is keyed by recipient, not by courier, and what it trusts is
+sshd alone: that the fingerprint in its own command line names the key
+that authenticated.
 
 [DESIGN.md](DESIGN.md) has the storage layout, the custody rules, and
-why there is no registration protocol.
+what a claim has to prove.
 
 ## License
 

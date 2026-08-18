@@ -30,6 +30,34 @@ authenticates the sender to the *reader*, and the depot is neither.
 opened. Which scheme carried the bytes is the courier's business, and
 the depot would store them the same either way.
 
+## Depend on an interface, never compute what the other computes
+
+Which is the line all three programs hold, and it is narrower than
+"know nothing about each other" for a reason: a courier that knew
+nothing about beb would need three knobs where it has none, since beb's
+filename is what makes a routing table unnecessary.
+
+The storage here is already opaque. A recipient is sixty-four lowercase
+hex characters and a frame is bytes nothing opens, so what waits here
+could be anything.
+
+The place it looks like this rule is broken is `authorize`, `grant` and
+`register`, which turn a public key into a queue name. That is not beb's
+naming rule being copied. **This depot keys storage by the recipient's
+key**, which is its own decision, stated above, and hex of the 32 raw
+bytes is the encoding of that key rather than a second opinion about
+what beb calls a mailbox. The two agree because there is one sensible
+encoding of 32 bytes, not because either is reading the other.
+
+Where it would be broken is putting that derivation somewhere it is not
+needed. `register` must relate a key to a queue: it verifies a signature
+made by a key and has to grant that key's queue and no other, and no
+arrangement of the claim avoids it. `unregister` verifies nothing, so it
+takes a queue name and the courier hands it through without
+understanding it. The convenience of piping `beb whoami` into both would
+have cost a derivation on the wire to save a paste, and `status` naming
+the address is the answer to that instead.
+
 ## Storage
 
     inbox/
@@ -102,68 +130,140 @@ instead: the same quarter second when nothing happens, and an
 immediate exit when the far end hangs up. A courier that waited and
 left has done nothing wrong, so that exit is a 0.
 
-## Who may collect, and why there is no register
+## Two questions, two pairs of verbs
 
-A courier collects for a recipient because an operator said so:
+Who may connect is one question, and which queues they may collect is
+another. They were one act while both answers had to reach a machine the
+courier was built to be unable to talk to, and `register` ended that.
 
-    beb-depot authorize laptop.handover
+    authorize / unauthorize     the courier: may it connect at all
+    grant / revoke              the queue: may it collect for that one
 
-One act: the key goes into `authorized_keys` behind the right forced
-command, and the grants go into `allowed`.
+**`authorize` is the only verb here that cannot take a fingerprint**, and
+the reason is not a preference. A fingerprint is a hash of the key, and
+the line sshd reads has to carry the key itself:
 
-That file is what `beb-courier whoami` prints -- a public key, then the
-queue names that machine reads for. Both facts have to cross to a
-machine the courier was built to be unable to reach, so they cross
-together, and the operator names neither. A bare `.pub` with the
-recipients as arguments works the same way.
+    command="…",restrict ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA… courier@laptop
 
-Both arguments are key files, and neither is transcribed. The courier's
-fingerprint comes from `ssh-keygen -lf`; the recipient's queue name is
-the 32 raw ed25519 bytes of the identity key, in hex, derived the same
-way beb names the mailbox. A queue name may still be given directly,
-since that is what a courier puts on the wire, but nobody has to
-produce one by hand -- which they did until `beb whoami > bob.pub` was
-enough, and that asymmetry was the last of the same hazard.
+sshd matches what a client offers against that blob, and nothing can
+rebuild it from a digest. A key store to look one up in would be a
+second copy of `authorized_keys`, able to disagree with the first.
 
-Both halves in one command because the fingerprint is the whole of the
-depot's notion of who is calling, and it used to be typed twice -- once
-into each file, 43 base64 characters that had to agree. When they
-disagreed nothing noticed, because from inside the depot the
-fingerprint simply *is* the caller; a mistyped one means one courier
-quietly collecting another's mail. So `authorize` derives it with
-`ssh-keygen -lf` and nobody transcribes anything. It also refuses a key
-that is already in `authorized_keys` under a different command, which
-is the same mistake arriving from the other direction.
+So the fingerprint is the name and the key is the thing. Exactly one
+verb introduces a courier and needs the thing; everything after refers to
+it by name, which is why `grant`, `revoke`, `serve`, `status` and
+`allowed` all speak fingerprints. `unauthorize` refers, so it takes
+either: the name, or the key file it is derived from.
 
-This is gitolite's answer, which solves the identical problem -- one
-Unix account, many keys, a forced command carrying the identity -- by
-generating `authorized_keys` rather than letting an operator write it.
-What stays human is the decision: this key, these recipients.
+Nothing is transcribed on either axis. The courier's fingerprint comes
+from `ssh-keygen -lf`; a recipient may be given as a queue name, since
+that is what a courier puts on the wire, or as the identity's public key
+file, whose queue name is its 32 raw ed25519 bytes in hex.
 
-`allow` remains for the case where the key is already in
-`authorized_keys`: one more recipient, no new courier.
+The fingerprint used to be typed twice, once into each file, 43 base64
+characters that had to agree. When they disagreed nothing noticed,
+because from inside the depot the fingerprint simply *is* the caller: a
+mistyped one means one courier quietly collecting another's mail. So it
+is derived, and `authorize` also refuses a key already in
+`authorized_keys` under a different command, which is the same mistake
+arriving from the other direction.
 
-The design once had a `register` verb instead -- the courier
-presenting a claim signed by each identity it holds, binding the
-identity key, the courier key, this depot, the operation, a nonce and
-an expiry -- and that protocol is right, but it buys one thing: adding
-an identity to a machine without an operator touching the depot. That
-is a scaling property, not a correctness one.
+This is gitolite's answer to the identical problem -- one Unix account,
+many keys, a forced command carrying the identity -- by generating
+`authorized_keys` rather than letting an operator write it. What stays
+human is the decision: this key connects.
 
-It is worth noticing what the real problem with operator-granted
-access turned out to be. It was never that a human decides; it was
-that a human transcribes. `authorize` fixes the transcription, and a
-signature-verification path stops being worth its weight.
+`authorize` still reads the file `beb-courier whoami` prints, and takes
+only the key out of it. The addresses beside it are named in the ack and
+left alone, because that list is a snapshot of what the machine read the
+day it was printed, and granting from a snapshot is how a grant list
+goes quietly stale. The identities say it themselves now, and say it
+signed.
 
-The two are not alternatives to hold side by side. A depot that
-verifies signed claims does not also want a second, weaker way to
-grant the same thing; when `register` arrives it should replace
-`allow`, which is why `allow` stays deliberately thin -- a line in a
-file, with nothing built on top of it.
+## register, and why it eventually earned its weight
 
-What makes deferring safe is that neither the wire nor the storage
-knows how a grant was made. `allowed` is consulted in one place, on
-collection, and a signed claim would write the same line.
+`authorize` fixed the transcription, which was the real problem with
+operator-granted access: it was never that a human decides, it was that
+a human copies 43 base64 characters into two files that must agree. What
+it did not fix was frequency. The key crosses once; the list of who
+reads on that machine goes stale every time somebody runs `beb init`,
+and re-declaring it meant another round trip to a machine the courier
+was built to be unable to reach.
+
+A handover crosses because it must. After it has, the two machines can
+talk, and the identity can say the thing itself:
+
+    register        read a claim from stdin, verify it, and grant
+
+A claim is three parts: the address, the fingerprint it authorises, and
+an sshsig over exactly those two lines.
+
+    ssh-ed25519 AAAA…
+    SHA256:abc…
+    -----BEGIN SSH SIGNATURE-----
+
+Verified with no trust store, which the depot could not have had anyway.
+The key is in the claim, so the one-line `allowed_signers` handed to
+`ssh-keygen -Y verify` is built from the thing being checked -- the same
+move beb makes on an envelope, for the same reason: there is nothing
+here that would know which keys to believe.
+
+Three checks, and the third is what the protocol is for.
+
+**The signature verifies**, in the namespace `beb-collect` and no other.
+An envelope is signed in `beb`, so a message can never be replayed as a
+claim on a queue.
+
+**The fingerprint in the claim is the one sshd says is calling.** So an
+intercepted claim is useless to anybody else, and a claim is not a
+bearer token.
+
+**The queue is derived from the signed key, never named beside it.**
+This is the one that keeps a valid claim from being aimed somewhere
+else. A courier that could put the queue name in a field could present
+somebody's genuine claim and ask for a third party's mail; deriving it
+means the grant can only ever be for the identity that signed.
+
+`grant` stays, and did not become the weaker second way this document
+once worried about, because the two answer different questions.
+`register` is a machine saying "this identity reads here". `grant` is an
+operator saying "collect for that one", which is still the only way to
+give a queue to a courier that cannot sign for it.
+
+`unregister <recipient>` is the courier giving up its own grant, and
+carries no signature. sshd already said who is calling and a courier can
+only remove its own line, so the worst it can do is stop its own mail.
+Adding a claim asserts something about an identity; dropping one asserts
+nothing. It is refused while frames are still waiting and nobody else
+collects for that recipient, because taking the last grant turns the
+next drop into a refusal and leaves what is already here with no
+collector: closer to deleting than to tidying, and one `sync` away from
+being neither.
+
+`revoke` is the operator's half of the same act, for the machine that
+never comes back. It cannot call in to give anything up, and its grant
+would otherwise keep a queue alive that nothing collects -- the one
+failure neither side can see from where it stands, since the depot sees
+a grant and the sender sees mail accepted.
+
+**`revoke` tidies a grant; it does not evict a machine**, and once
+`register` existed the difference stopped being academic. A courier
+whose line is still in `authorized_keys` can connect, and if it still
+holds an identity's key it signs a fresh claim and takes the grant
+straight back, in one command and without an operator. Re-granting used
+to need one; it does not now.
+
+So `unauthorize` is the inverse of `authorize`, and the only thing here
+that cuts a machine off. `authorize` wrote two things, a line sshd reads
+and a set of grants, and both go: leaving the grants would keep `drop`
+accepting mail for a queue no courier can ever come for, which is the
+hazard this document names elsewhere and would be creating on purpose.
+
+It is the one place that rewrites `authorized_keys` rather than
+appending, which `authorize` refuses to do, and there is no way around
+it -- a line cannot be removed by appending. Written beside and renamed
+over, so no reader sees half a file, and each line it takes is printed
+first, because that file is one other things also write to.
 
 ## Custody
 

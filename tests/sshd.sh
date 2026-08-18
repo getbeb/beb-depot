@@ -68,8 +68,10 @@ sshc() { # <remote command> [stdin file]
         127.0.0.1 "$1" <"${2:-/dev/null}"
 }
 
-"$DEPOT" authorize "$W/courier.pub" "$KEY" >"$W/line" 2>/dev/null || die "authorize"
-ok "authorize wrote the line sshd is about to read"
+"$DEPOT" authorize "$W/courier.pub" >"$W/line" 2>/dev/null || die "authorize"
+FP=$(ssh-keygen -lf "$W/courier.pub" | awk '{print $2}')
+"$DEPOT" grant "$FP" "$KEY" >/dev/null 2>&1 || die "grant"
+ok "authorize wrote the line sshd is about to read, and grant said what it collects"
 
 printf 'a real frame over a real wire' >"$W/frame"
 sshc "drop $KEY" "$W/frame" 2>"$W/err" || die "drop over ssh: $(cat "$W/err")"

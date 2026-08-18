@@ -67,8 +67,8 @@ ok "an address is an ssh key; a depot queue is those same bytes in hex"
 # beb decides it when it writes the outbox, the depot decides it when an
 # operator sets things up, and neither would notice the other drifting.
 printf 'ssh-ed25519 %s bob\n' "$BOB" >"$W/bob.pub"
-"$DEPOT" allow "SHA256:dddd3333333333333333333333333333333333333333" "$W/bob.pub" \
-    >/dev/null 2>"$W/derr" || die "depot allow by key file: $(cat "$W/derr")"
+"$DEPOT" grant "SHA256:dddd3333333333333333333333333333333333333333" "$W/bob.pub" \
+    >/dev/null 2>"$W/derr" || die "depot grant by key file: $(cat "$W/derr")"
 grep -q "may now collect for $BOBHEX" "$W/derr" ||
     die "the depot derived a different queue than beb did: $(cat "$W/derr")"
 ok "the depot derives the same queue name from the key that beb derives from it"
@@ -86,7 +86,7 @@ name=${f##*/}; to=${name#*-}
 test "$to" = "$BOBHEX" || die "the outbox names $to, bob is $BOBHEX"
 ok "the outbox filename carries the recipient, so the courier reads no frames"
 
-"$DEPOT" allow "$FP" "$BOBHEX" >/dev/null 2>&1 || die "allow"
+"$DEPOT" grant "$FP" "$BOBHEX" >/dev/null 2>&1 || die "grant"
 SSH_ORIGINAL_COMMAND="drop $to" "$DEPOT" serve "$FP" <"$f" >/dev/null 2>&1 || die "drop at depot"
 rm -f "$f"
 test -e "$f" && die "the outbox still holds a shipped frame"
@@ -130,5 +130,43 @@ ok "bob reads it, signed by alice, across two machines that never met"
 as bob read >/dev/null 2>&1; rc=$?
 test "$rc" -eq 2 || die "a second read exited $rc, wanted 2 (nothing to do)"
 ok "and once only: the second read has nothing to do"
+
+# ---- register: a grant nobody had to type -------------------------------
+#
+# The depot verifies rather than trusts, and needs no trust store: the
+# key is in the claim, and the queue it grants is derived from that same
+# key rather than named beside it. Only a real beb can make one of
+# these, which is why it is here rather than in e2e.sh.
+
+ADDR=$(as alice whoami 2>/dev/null)
+Q=$(printf '%s' "$ADDR" | python3 -c \
+    'import base64,sys; print(base64.b64decode(sys.stdin.read().split()[1])[19:51].hex())')
+OTHER="SHA256:dddd3333333333333333333333333333333333333333"
+printf '%s\n%s\n' "$ADDR" "$FP" >"$W/payload"
+as alice sign beb-collect <"$W/payload" >"$W/sig" 2>/dev/null || die "sign the claim"
+cat "$W/payload" "$W/sig" >"$W/claim"
+
+SSH_ORIGINAL_COMMAND="register" "$DEPOT" serve "$FP" <"$W/claim" 2>"$W/err" ||
+    die "register: $(cat "$W/err")"
+grep -q "^$FP $Q\$" "$BEB_DEPOT_ROOT/allowed" ||
+    die "no grant was written: $(cat "$BEB_DEPOT_ROOT/allowed")"
+ok "register verifies a claim and grants the queue derived from the signed key"
+
+SSH_ORIGINAL_COMMAND="register" "$DEPOT" serve "$OTHER" <"$W/claim" 2>"$W/err" &&
+    die "another courier presented that claim"
+grep -q 'this connection is' "$W/err" || die "the fingerprint was not checked: $(cat "$W/err")"
+ok "a claim authorises one fingerprint, and sshd decides which one is calling"
+
+as alice sign beb <"$W/payload" >"$W/sig2" 2>/dev/null || die "sign in beb's namespace"
+cat "$W/payload" "$W/sig2" >"$W/claim2"
+SSH_ORIGINAL_COMMAND="register" "$DEPOT" serve "$FP" <"$W/claim2" 2>"$W/err" &&
+    die "an envelope-namespace signature registered"
+grep -q 'does not verify' "$W/err" || die "the namespace was not enforced: $(cat "$W/err")"
+ok "and only in its own namespace, so an envelope cannot be replayed as one"
+
+SSH_ORIGINAL_COMMAND="unregister $Q" "$DEPOT" serve "$FP" 2>"$W/err" ||
+    die "unregister: $(cat "$W/err")"
+grep -q "^$FP $Q\$" "$BEB_DEPOT_ROOT/allowed" && die "the grant is still there"
+ok "a courier gives up its own grant with no signature at all"
 
 echo "all $n tests passed"

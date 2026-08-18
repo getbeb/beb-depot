@@ -83,54 +83,66 @@ impl From<&str> for Fail {
 }
 
 const USAGE: &str = "\
-beb-depot {version} holds beb mail for keys that read somewhere else.
+beb-depot {version} stores beb mail until an authorized courier collects it.
 
-  beb-depot authorize KEYFILE [RECIPIENT...]
-      let that courier in, and let it collect for those recipients
-  beb-depot serve [--root PATH] FINGERPRINT
-      answer one connection; sshd runs this as a forced command
-  beb-depot allow FINGERPRINT RECIPIENT
-      one more recipient for a courier already let in
+Two permissions: who may connect, and which queues they may collect.
+authorize and unauthorize decide the first, grant and revoke the second.
+
+  beb-depot authorize KEYFILE
+      let a courier connect; KEYFILE is its public key, or - for stdin
+  beb-depot unauthorize COURIER
+      stop it connecting, and remove every queue grant it holds
+
+  beb-depot grant COURIER RECIPIENT
+      let a courier collect for one recipient queue
+  beb-depot revoke COURIER RECIPIENT
+      stop it collecting for that one
+
   beb-depot held
-      what is waiting, and for whom
+      queued mail, and the recipients it is waiting for
   beb-depot status
-      whether the lines sshd reads still describe this depot
+      whether this install still matches the authorized_keys entries
+  beb-depot serve [--root PATH] FINGERPRINT
+      serve one connection; sshd runs this, not you
 
   beb-depot --help
   beb-depot --version
 
-A RECIPIENT is a queue name, 64 lowercase hex, or the path to a beb
-identity's public key file, which this converts to one. A KEYFILE is a
-courier's public key, or \"-\" for stdin; its fingerprint is derived,
-never typed. If it is what beb-courier whoami printed, it names its own
-recipients and you need give none.
+A courier normally asks for a queue itself, with beb-courier register,
+signed and sent over a connection authorize already allowed. Use grant
+when the recipient cannot ask.
+
+A COURIER is a fingerprint, or the key file it came from, or - for that
+key on stdin. A RECIPIENT is a 64-character lowercase hex id, or a beb
+identity's public key file, or - for that key on stdin. Given a key,
+either is derived from it, so nothing long is ever typed.
 
 Exit: 0 did it, 1 change the command, 2 nothing to do, 3 refused.
 
-It holds at most 64 MiB per frame, and per recipient 10000 frames or
-1 GiB, whichever comes first. Anything that has waited more than 30
-days is dropped, swept by whatever touches the queue next.
+A frame may be at most 64 MiB. A queue holds at most 10000 frames or
+1 GiB, and frames older than 30 days go when it is next used. None of
+those four is configurable.
 
-BEB_DEPOT_ROOT names where it keeps things. It defaults to
-~/.local/share/beb-depot, and holds:
+BEB_DEPOT_ROOT is the storage directory, ~/.local/share/beb-depot by
+default: one grant per line in allowed, and one frame per file under
+inbox/<recipient>/<id>.
 
-  allowed                    one \"FINGERPRINT RECIPIENT\" line each
-  inbox/<recipient>/<id>     one whole frame per file
-
-BEB_DEPOT_AUTHORIZED_KEYS names the file authorize writes. It defaults
-to ~/.ssh/authorized_keys, and gains one line per courier:
+BEB_DEPOT_AUTHORIZED_KEYS is the authorized_keys file authorize writes,
+~/.ssh/authorized_keys by default. Each entry looks like:
 
   command=\"'/path/to/beb-depot' serve --root '/path' SHA256:...\",restrict ssh-...
 
-That fingerprint is the depot's whole notion of who is calling, which
-is why authorize derives it from the key file rather than asking.";
+The fingerprint in it is who beb-depot takes the connection to be, which
+is why authorize needs the key and cannot take a fingerprint.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = match args.first().map(String::as_str) {
         Some("serve") => cmd_serve(&args[1..]),
         Some("authorize") => cmd_authorize(&args[1..]),
-        Some("allow") => cmd_allow(&args[1..]),
+        Some("grant") => cmd_grant(&args[1..]),
+        Some("revoke") => cmd_revoke(&args[1..]),
+        Some("unauthorize") => cmd_unauthorize(&args[1..]),
         Some("held") => cmd_held(&args[1..]),
         Some("status") => cmd_status(&args[1..]),
         Some("--help") | Some("-h") | None => {
@@ -230,18 +242,21 @@ fn allowed_for(root: &Path, fp: &str) -> Vec<String> {
         .collect()
 }
 
-fn cmd_allow(args: &[String]) -> Result<(), Fail> {
+fn cmd_grant(args: &[String]) -> Result<(), Fail> {
     let (fp, to) = match args {
         [fp, to] => (fp.as_str(), to.as_str()),
         _ => {
-            return Err("allow takes a fingerprint and a recipient: \
-                        beb-depot allow FINGERPRINT RECIPIENT"
+            return Err("grant takes a fingerprint and a recipient: \
+                        beb-depot grant FINGERPRINT RECIPIENT"
                 .into())
         }
     };
-    if !valid_fingerprint(fp) {
-        return Err(format!("\"{fp}\" is not a fingerprint; ssh-keygen -lf prints one as SHA256:...").into());
+    // Only one of them can be the pipe, and saying so beats reading an
+    // empty stream and refusing something that looks unrelated.
+    if fp == "-" && to == "-" {
+        return Err(refused("only one of those can be -, since both would read the same stdin"));
     }
+    let fp = &as_fingerprint(fp)?;
     let to = &as_recipient(to)?;
     let root = root()?;
     if !grant(&root, fp, to)? {
@@ -275,6 +290,164 @@ fn grant(root: &Path, fp: &str, to: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Take one grant away. `false` means it was not there.
+///
+/// Rewritten rather than appended to, which is why it is the only writer
+/// here that can lose a line somebody else added in between. The file is
+/// small, both writers are an operator or one connection, and the
+/// alternative is a lock on a file whose whole virtue is that an
+/// operator can edit it in a text editor.
+fn ungrant(root: &Path, fp: &str, to: &str) -> Result<bool, String> {
+    let path = allowed_path(root);
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let mut kept = String::new();
+    let mut gone = false;
+    for l in text.lines() {
+        let mut f = l.split_whitespace();
+        if (f.next(), f.next()) == (Some(fp), Some(to)) {
+            gone = true;
+            continue;
+        }
+        kept.push_str(l);
+        kept.push('\n');
+    }
+    if !gone {
+        return Ok(false);
+    }
+    let tmp = path.with_extension("tmp");
+    private_file(&tmp)
+        .and_then(|mut f| f.write_all(kept.as_bytes()).and_then(|_| f.sync_all()))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    fsync_dir(root).map_err(|e| format!("cannot sync {}: {e}", root.display()))?;
+    Ok(true)
+}
+
+/// Every grant a fingerprint holds, gone. Returns how many.
+fn ungrant_all(root: &Path, fp: &str) -> Result<Vec<String>, String> {
+    let held = allowed_for(root, fp);
+    for to in &held {
+        ungrant(root, fp, to)?;
+    }
+    Ok(held)
+}
+
+/// The inverse of `authorize`, and the only thing that evicts a machine.
+///
+/// `revoke` takes one grant back and leaves the courier able to connect,
+/// which is right for tidying and wrong for distrust: a courier that can
+/// still connect and still holds an identity's key signs a fresh claim
+/// and `register` puts the grant straight back. Cutting a machine off is
+/// removing the line sshd reads, and nothing did that until this.
+///
+/// It takes the grants with it, because leaving them is the hazard the
+/// design names: a grant with no courier keeps `drop` accepting mail for
+/// a queue that nothing will ever collect. `authorize` wrote both, so
+/// both go.
+fn cmd_unauthorize(args: &[String]) -> Result<(), Fail> {
+    let arg = match args {
+        [a] => a.as_str(),
+        _ => {
+            return Err("unauthorize takes the key file, or the fingerprint derived from it: \
+                        beb-depot unauthorize KEYFILE | FINGERPRINT"
+                .into())
+        }
+    };
+    // A fingerprint if it is one, and otherwise the file it is derived
+    // from, the same way `grant` takes either shape of a recipient.
+    let fp = as_fingerprint(arg)?;
+
+    let ak = authorized_keys_path()?;
+    let text = fs::read_to_string(&ak).unwrap_or_default();
+    let (mut kept, mut gone) = (String::new(), 0);
+    for l in text.lines() {
+        // On the fingerprint alone, never the whole command, for the
+        // reason `authorize` matches that way: the command gained
+        // --root once already, and a match that breaks when the format
+        // shifts is a match that leaves the line it meant to take.
+        if l.contains(&fp) {
+            gone += 1;
+            // The whole line, so an operator sees exactly what went from a
+            // file other things also write to.
+            note(&format!("removing: {}", l.trim()));
+            continue;
+        }
+        kept.push_str(l);
+        kept.push('\n');
+    }
+
+    let root = root()?;
+    let held = ungrant_all(&root, &fp).map_err(Fail::from)?;
+    if gone == 0 && held.is_empty() {
+        return Err(Fail { code: 2, msg: format!("{fp} was not let in here anyway") });
+    }
+    if gone > 0 {
+        // Rewritten, which is the one thing `authorize` refuses to do,
+        // and unavoidable here: a line cannot be removed by appending.
+        // Written beside and renamed over, so a reader never sees half.
+        let tmp = ak.with_extension("beb-depot-tmp");
+        private_file(&tmp)
+            .and_then(|mut f| f.write_all(kept.as_bytes()).and_then(|_| f.sync_all()))
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &ak).map_err(|e| format!("cannot replace {}: {e}", ak.display()))?;
+        note(&format!("{fp} can no longer connect; {gone} line gone from {}", ak.display()));
+    } else {
+        note(&format!("{fp} had no line in {}", ak.display()));
+    }
+
+    // What it was holding, and what is still on the shelf for it, which
+    // is now mail with nobody to come for it.
+    for to in &held {
+        let q = sweep(&inbox(&root, to));
+        if q.items > 0 && !allowed_line_exists(&root, to) {
+            note(&format!(
+                "{} still {} for {to}, and nobody collects for it now",
+                if q.items == 1 { "1 frame".to_string() } else { format!("{} frames", q.items) },
+                if q.items == 1 { "waits" } else { "wait" }
+            ));
+        }
+    }
+    match held.len() {
+        0 => {}
+        1 => note("1 grant went with it"),
+        n => note(&format!("{n} grants went with it")),
+    }
+    Ok(())
+}
+
+/// The operator's half of taking a grant back.
+///
+/// A courier gives up its own with `beb-courier unregister`, over the
+/// connection it already has, and that is the ordinary case. This is for
+/// the machine that never comes back: it cannot call in, and its grant
+/// would otherwise keep a queue alive that nothing collects, which is
+/// the one failure neither side can see from where it stands.
+fn cmd_revoke(args: &[String]) -> Result<(), Fail> {
+    let (fp, to) = match args {
+        [fp, to] => (fp.as_str(), to.as_str()),
+        _ => {
+            return Err("revoke takes a fingerprint and a recipient: \
+                        beb-depot revoke FINGERPRINT RECIPIENT"
+                .into())
+        }
+    };
+    if fp == "-" && to == "-" {
+        return Err(refused("only one of those can be -, since both would read the same stdin"));
+    }
+    let fp = &as_fingerprint(fp)?;
+    let to = &as_recipient(to)?;
+    let root = root()?;
+    if !ungrant(&root, fp, to)? {
+        return Err(Fail { code: 2, msg: format!("{fp} could not collect for {to} anyway") });
+    }
+    let left = allowed_line_exists(&root, to);
+    note(&format!("{fp} may no longer collect for {to}"));
+    if !left {
+        note(&format!("nobody collects for {to} now, so drops for it are refused"));
+    }
+    Ok(())
+}
+
 // ---- letting a courier in ----------------------------------------------
 
 /// Where sshd looks. Overridable because a depot is sometimes not the
@@ -306,41 +479,33 @@ fn authorized_keys_path() -> Result<PathBuf, String> {
 /// never transcribes it. What is left for a human is the decision --
 /// this key, these recipients -- which is the part a human should have.
 fn cmd_authorize(args: &[String]) -> Result<(), Fail> {
-    let (keyfile, given) = match args {
-        [k, rest @ ..] => (Path::new(k.as_str()), rest),
+    let keyfile = match args {
+        [k] => Path::new(k.as_str()),
         _ => {
-            return Err("authorize takes a courier's key file, and the recipients it \
-                        collects for: beb-depot authorize KEYFILE [RECIPIENT...]"
+            return Err("authorize takes a courier's key file: beb-depot authorize KEYFILE\n\
+                        which queues it collects for is grant, or register from its end"
                 .into())
         }
     };
-    // A handover file carries both: beb-courier whoami prints the key
-    // first and the queue names after it, so that the two facts travel
-    // together to a machine the courier was built to be unable to reach.
-    // Naming recipients on the command line still works, and adds to
-    // whatever the file already said.
-    let handover = read_handover(keyfile)?;
-    let carried = handover.recipients;
-    if given.is_empty() && carried.is_empty() {
+    // The key alone. It used to take the recipients too, because both
+    // facts had to reach a machine the courier was built to be unable to
+    // talk to, and the file `beb-courier whoami` prints carries both.
+    // `register` retired that: once the key is in, the identity says the
+    // rest itself, signed, over this connection. So the two axes stopped
+    // needing one verb, and this one decides only who may connect.
+    // A fingerprint is a hash of the key, so this verb is the one place
+    // that cannot take one: the line it writes has to carry the key
+    // itself. `unauthorize` takes either because it only has to find a
+    // line that already holds both.
+    if valid_fingerprint(&keyfile.to_string_lossy()) {
         return Err(refused(format!(
-            "{} names no recipients, and none were given\n\
-             beb-courier whoami prints a file that carries them, or name them here",
+            "{} is a fingerprint, and authorize needs the key it was made from\n\
+             a fingerprint is a hash, so the line sshd reads cannot be rebuilt from one",
             keyfile.display()
         )));
     }
-    let recipients: Vec<String> = given.to_vec();
-    // Everything is resolved before anything is written: a half-authorized
-    // courier is a key that can connect and collect nothing, which looks
-    // like a depot fault rather than a typo.
-    let mut recipients: Vec<String> = recipients
-        .iter()
-        .map(|r| as_recipient(r))
-        .collect::<Result<_, _>>()?;
-    for c in carried {
-        if !recipients.contains(&c) {
-            recipients.push(c);
-        }
-    }
+    let handover = read_handover(keyfile)?;
+    let carried = handover.recipients.len();
     let key = handover.key;
     let fp = fingerprint_of(keyfile, &key)?;
     let exe = shell_word(&forced_command_binary()?)?;
@@ -378,33 +543,26 @@ fn cmd_authorize(args: &[String]) -> Result<(), Fail> {
         append_line(&ak, &line)?;
     }
 
-    let mut added = Vec::new();
-    for to in &recipients {
-        if grant(&root, &fp, to)? {
-            added.push(to.as_str());
-        }
-    }
-
     // stdout carries the line, so it can be piped to a depot elsewhere
     // even when this run had nothing of its own to write.
     println!("{line}");
-    if keyed && added.is_empty() {
-        return Err(Fail {
-            code: 2,
-            msg: format!("{fp} was already authorized for all {} recipients", recipients.len()),
-        });
+    if keyed {
+        return Err(Fail { code: 2, msg: format!("{fp} could already connect") });
     }
-    if !keyed {
-        note(&format!("added {} to {}", fp, ak.display()));
+    note(&format!("added {fp} to {}", ak.display()));
+    note("sshd needs no reload; it reads authorized_keys on each connection");
+    // Said rather than acted on. A handover names what that machine read
+    // for the day it was printed, and granting from a snapshot is how a
+    // list goes quietly stale; the identities say it themselves now.
+    if carried > 0 {
+        note(&format!(
+            "that file also names {carried}; those are register's to say, from the other end"
+        ));
     }
-    match added.len() {
-        0 => note(&format!("{fp} could already collect for every one of those")),
-        1 => note(&format!("{fp} may now collect for {}", added[0])),
-        n => note(&format!("{fp} may now collect for {n} recipients")),
-    }
-    if !keyed {
-        note("sshd needs no reload; it reads authorized_keys on each connection");
-    }
+    note(&format!(
+        "it collects for nothing yet: beb-depot grant {fp} <recipient>\n\
+         or that machine says so itself, with beb-courier register"
+    ));
     Ok(())
 }
 
@@ -415,18 +573,43 @@ fn cmd_authorize(args: &[String]) -> Result<(), Fail> {
 /// base64 blob themselves -- the same transcription hazard `authorize`
 /// exists to remove, left sitting in the other half of the command. beb
 /// prints the key; this turns the key into the queue.
+/// A courier's fingerprint, from either of the two things an operator
+/// has to hand: the fingerprint itself, or the key file it comes from.
+///
+/// The same shape as `as_recipient`, for the same reason. `authorize`
+/// prints the fingerprint, so pasting one is easy, but the file that was
+/// authorized is usually still sitting there and naming it types
+/// nothing at all.
+fn as_fingerprint(arg: &str) -> Result<String, Fail> {
+    if valid_fingerprint(arg) {
+        return Ok(arg.to_string());
+    }
+    let p = Path::new(arg);
+    if arg == "-" || p.is_file() {
+        return fingerprint_of(p, &read_handover(p)?.key);
+    }
+    Err(refused(format!(
+        "\"{arg}\" is neither a fingerprint nor a key file\n\
+         ssh-keygen -lf prints one as SHA256:..., and authorize printed it too"
+    )))
+}
+
 fn as_recipient(arg: &str) -> Result<String, Fail> {
     if valid_recipient(arg) {
         return Ok(arg.to_string());
     }
     let p = Path::new(arg);
-    if p.is_file() {
+    // "-" the same way `authorize` takes it, so the key can arrive on a
+    // pipe from the machine that holds it and no file is left behind:
+    //
+    //   ssh client 'BEB_IDENTITY=~/x beb whoami' | beb-depot grant <fp> -
+    if arg == "-" || p.is_file() {
         return recipient_of(p);
     }
     Err(refused(format!(
         "\"{arg}\" is neither a recipient nor a public key file\n\
          a recipient is 64 lowercase hex characters; a key file is the .pub of a \
-         beb identity, whose contents beb whoami prints"
+         beb identity, whose contents beb whoami prints, or - for stdin"
     )))
 }
 
@@ -435,12 +618,20 @@ fn as_recipient(arg: &str) -> Result<String, Fail> {
 /// Derived the same way beb names the mailbox -- the second string of
 /// the ssh wire encoding, which for ed25519 is exactly the 32 bytes.
 fn recipient_of(p: &Path) -> Result<String, Fail> {
-    let key = read_handover(p)?.key;
+    recipient_of_key(&read_handover(p)?.key, &p.display().to_string())
+}
+
+/// The same, from the key text, which is what arrives on the wire.
+///
+/// Never taken as a separate field beside the key. A courier that could
+/// name the queue it wanted would be a courier that could ask for
+/// somebody else's, and the signature it presents says nothing about a
+/// number it did not sign.
+fn recipient_of_key(key: &str, what: &str) -> Result<String, Fail> {
     let mut f = key.split_whitespace();
     let kind = f.next().unwrap_or_default().to_string();
     let blob = f.next().unwrap_or_default();
-    let bytes =
-        b64(blob).ok_or_else(|| refused(format!("{}: the key is not base64", p.display())))?;
+    let bytes = b64(blob).ok_or_else(|| refused(format!("{what}: the key is not base64")))?;
     let raw = ssh_string(&bytes, 0)
         .and_then(|(t, at)| ssh_string(&bytes, at).map(|(k, _)| (t, k)))
         .filter(|(t, k)| *t == b"ssh-ed25519".as_slice() && k.len() == 32)
@@ -448,9 +639,8 @@ fn recipient_of(p: &Path) -> Result<String, Fail> {
     match raw {
         Some(k) => Ok(k.iter().map(|b| format!("{b:02x}")).collect()),
         None => Err(refused(format!(
-            "{} is a {kind} key; a beb identity is ed25519, and its queue name is \
-             those 32 key bytes in hex",
-            p.display()
+            "{what} is a {kind} key; a beb identity is ed25519, and its queue name is \
+             those 32 key bytes in hex"
         ))),
     }
 }
@@ -717,10 +907,212 @@ fn cmd_serve(args: &[String]) -> Result<(), Fail> {
         (Some("drop"), Some(to), None) => do_drop(&root, fp, to),
         (Some("pickup"), None, None) => do_pickup(&root, fp, true),
         (Some("drain"), None, None) => do_pickup(&root, fp, false),
+        (Some("register"), None, None) => do_register(&root, fp),
+        (Some("unregister"), Some(to), None) => do_unregister(&root, fp, to),
+        (Some("granted"), None, None) => do_granted(&root, fp),
         _ => Err(refused(
-            "say drop <recipient>, pickup, or drain; nothing else is served here",
+            "say drop <recipient>, pickup, drain, register, granted, or \
+             unregister <recipient>; nothing else is served here",
         )),
     }
+}
+
+/// A claim this depot will read, which is small by construction: two
+/// lines and an armoured signature. The cap is here so a courier cannot
+/// make the depot allocate for a file it has no reason to send.
+const CLAIM_MAX: u64 = 16 * 1024;
+
+/// The namespace a collection claim is signed in.
+///
+/// Its own, and not `beb`, because a namespace is the whole of what
+/// stops a signature made for one purpose being presented as another.
+/// An envelope signature must never be usable as a claim on a queue.
+const CLAIM_NAMESPACE: &str = "beb-collect";
+
+/// register: an identity says, in its own hand, that this courier may
+/// collect for it.
+///
+/// The depot verifies rather than trusts, and it needs no trust store to
+/// do it: the key is in the claim, and the claim's whole content is that
+/// key plus the fingerprint sshd already told us. So the allowed_signers
+/// handed to ssh-keygen is built from the thing being checked, which is
+/// how beb verifies an envelope too.
+///
+/// Three things have to hold, and the third is the one that matters:
+/// the signature verifies, the fingerprint in it is the caller's, and
+/// the queue granted is derived from the signed key rather than named
+/// beside it. Without the third, a courier could present a stranger's
+/// valid claim and ask for anybody's mail.
+fn do_register(root: &Path, fp: &str) -> Result<(), Fail> {
+    let mut claim = String::new();
+    io::stdin()
+        .lock()
+        .take(CLAIM_MAX + 1)
+        .read_to_string(&mut claim)
+        .map_err(|e| Fail::from(format!("cannot read the claim: {e}")))?;
+    if claim.len() as u64 > CLAIM_MAX {
+        return Err(refused("that claim is larger than any claim needs to be"));
+    }
+    let mut lines = claim.splitn(3, '\n');
+    let (address, said_fp, signature) = match (lines.next(), lines.next(), lines.next()) {
+        (Some(a), Some(f), Some(sig)) if !a.is_empty() && !sig.is_empty() => (a, f, sig),
+        _ => {
+            return Err(refused(
+                "a claim is an address, a fingerprint, and a signature, one per line",
+            ))
+        }
+    };
+    // What sshd decided beats what the claim says it is. A claim naming
+    // somebody else is not this caller's to present, and saying so here
+    // is cheaper than letting the signature check pass and the grant go
+    // to a fingerprint that is not on this connection.
+    if said_fp != fp {
+        return Err(refused(format!(
+            "that claim authorises {said_fp}, and this connection is {fp}"
+        )));
+    }
+    let to = recipient_of_key(address, "the claim")?;
+    // Exactly the bytes the signer signed, rebuilt rather than trusted:
+    // the two lines and the newlines that ended them.
+    let signed = format!("{address}\n{said_fp}\n");
+    verify_claim(root, address, &signed, signature)?;
+
+    if grant(root, fp, &to)? {
+        note(&format!("{fp} may now collect for {to}, by its own signature"));
+    } else {
+        note(&format!("{fp} could already collect for {to}"));
+    }
+    Ok(())
+}
+
+/// Verify one claim, consulting no trust store.
+fn verify_claim(root: &Path, address: &str, signed: &str, signature: &str) -> Result<(), Fail> {
+    let scratch = root.join(format!(".tmp-register-{}", std::process::id()));
+    private_dir_all(&scratch)
+        .map_err(|e| Fail::from(format!("cannot create {}: {e}", scratch.display())))?;
+    let out = verify_in(&scratch, address, signed, signature);
+    let _ = fs::remove_dir_all(&scratch);
+    out
+}
+
+fn verify_in(scratch: &Path, address: &str, signed: &str, signature: &str) -> Result<(), Fail> {
+    let allowed = scratch.join("signers");
+    private_file(&allowed)
+        .and_then(|mut f| f.write_all(format!("{CLAIM_NAMESPACE} {address}\n").as_bytes()))
+        .map_err(|e| format!("cannot write scratch: {e}"))?;
+    let sig = scratch.join("sig");
+    private_file(&sig)
+        .and_then(|mut f| f.write_all(signature.as_bytes()))
+        .map_err(|e| format!("cannot write scratch: {e}"))?;
+
+    let mut child = std::process::Command::new("ssh-keygen")
+        .args(["-Y", "verify", "-I", CLAIM_NAMESPACE, "-n", CLAIM_NAMESPACE, "-f"])
+        .arg(&allowed)
+        .arg("-s")
+        .arg(&sig)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Fail::from(format!("cannot run ssh-keygen: {e}")))?;
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(signed.as_bytes())
+        .map_err(|e| format!("cannot hand over the claim: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| Fail::from(format!("cannot run ssh-keygen: {e}")))?;
+    if !out.status.success() {
+        return Err(refused(format!(
+            "that claim does not verify against the address in it: {}",
+            String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("no reason given")
+        )));
+    }
+    Ok(())
+}
+
+/// granted: what this courier may collect for, and nothing else.
+///
+/// Read-only, moves no mail, and answers only about the caller: a
+/// courier cannot ask what anybody else holds, because the fingerprint
+/// is sshd's and not an argument.
+///
+/// It exists because a grant and a mailbox are in two places and drift
+/// apart in both directions. An identity removed from a machine leaves a
+/// grant nothing collects on, which is the one failure neither end can
+/// see: the depot has a queue that looks alive and the sender's mail is
+/// accepted. An identity added and never registered is the same gap the
+/// other way round. Neither is visible without asking, so this is the
+/// asking.
+fn do_granted(root: &Path, fp: &str) -> Result<(), Fail> {
+    let mine = allowed_for(root, fp);
+    let mut out = io::stdout().lock();
+    for to in &mine {
+        writeln!(out, "{to}").map_err(|e| format!("cannot write: {e}"))?;
+    }
+    drop(out);
+    match mine.len() {
+        1 => note("1 recipient to collect for"),
+        n => note(&format!("{n} recipients to collect for")),
+    }
+    Ok(())
+}
+
+/// unregister: a courier gives up its own grant.
+///
+/// No signature, and none is needed. sshd already said who is calling,
+/// and a courier can only ever remove its own line, so the worst it can
+/// do is stop its own mail. Adding a claim asserts something about
+/// somebody else's identity; dropping one asserts nothing.
+///
+/// Refused while frames are still waiting, because taking the last grant
+/// away turns the next drop into a refusal and leaves what is already
+/// here with no collector at all. That is closer to deleting than to
+/// tidying, and the fix is one `sync` away.
+fn do_unregister(root: &Path, fp: &str, to: &str) -> Result<(), Fail> {
+    if !valid_recipient(to) {
+        return Err(refused(format!("\"{to}\" is not a recipient")));
+    }
+    // A queue name and never a key, unlike `register`, which has to
+    // relate the two to check a signature. Deriving one from the other
+    // is beb's rule about how a mailbox is named; this end knows it, at
+    // a desk, where `authorize` spares an operator the decoding. On the
+    // wire there is nothing to spare and no reason to know.
+    //
+    // Nothing about this recipient is touched or said before the caller
+    // is known to hold a line for it. Sweeping first was the same
+    // sentence to read either way, and it made `unregister` a way to ask
+    // whether somebody else's queue had traffic: the sweep prints what
+    // it dropped, and a courier granted nothing would hear it.
+    if !allowed_for(root, fp).iter().any(|r| r == to) {
+        return Err(Fail { code: 2, msg: format!("{fp} could not collect for {to} anyway") });
+    }
+    let dir = inbox(root, to);
+    let q = sweep(&dir);
+    swept(to, &q);
+    // Anybody else granted this recipient, who would still come for it.
+    let others = fs::read_to_string(allowed_path(root))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| {
+            let mut f = l.split_whitespace();
+            matches!((f.next(), f.next()), (Some(who), Some(what)) if what == to && who != fp)
+        })
+        .count();
+    if q.items > 0 && others == 0 {
+        return Err(refused(format!(
+            "{to} is still holding {} frames, and nobody else collects for it\n\
+             take them first, then unregister",
+            q.items
+        )));
+    }
+    if !ungrant(root, fp, to)? {
+        return Err(Fail { code: 2, msg: format!("{fp} could not collect for {to} anyway") });
+    }
+    note(&format!("{fp} may no longer collect for {to}"));
+    Ok(())
 }
 
 /// Read one frame from stdin and file it. The recipient is an argument,
@@ -736,7 +1128,9 @@ fn do_drop(root: &Path, fp: &str, to: &str) -> Result<(), Fail> {
     // nobody to collect it, so the frame would sit forever.
     if !allowed_line_exists(root, to) {
         return Err(refused(format!(
-            "nobody collects for {to} here; an operator allows it with: beb-depot allow <fingerprint> {to}"
+            "nobody collects for {to} here\n\
+             its own courier says so with register, or an operator with: \
+             beb-depot grant <fingerprint> {to}"
         )));
     }
     let dir = inbox(root, to);
@@ -851,7 +1245,7 @@ fn do_pickup(root: &Path, fp: &str, wait: bool) -> Result<(), Fail> {
     let mine = allowed_for(root, fp);
     if mine.is_empty() {
         return Err(refused(format!(
-            "{fp} collects for nobody here; an operator allows it with: beb-depot allow {fp} <recipient>"
+            "{fp} collects for nobody here; an operator grants one with: beb-depot grant {fp} <recipient>"
         )));
     }
     // Once, at the start: a courier must never be handed something the
@@ -1043,12 +1437,12 @@ fn cmd_status(args: &[String]) -> Result<(), Fail> {
 
     let text = fs::read_to_string(allowed_path(&root)).unwrap_or_default();
     let grants: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let mut couriers: Vec<&str> = grants
-        .iter()
-        .filter_map(|l| l.split_whitespace().next())
-        .collect();
-    couriers.sort_unstable();
-    couriers.dedup();
+    // Counted from the two files separately, because they answer the two
+    // questions this depot keeps apart: authorized_keys is who may
+    // connect, `allowed` is what they may collect. A courier authorized
+    // and granted nothing is a real state now -- it is what `authorize`
+    // leaves behind, waiting for `register` -- and counting couriers out
+    // of the grant file would report it as nobody being there at all.
 
     // Every line sshd would run, taken apart the way sshd takes it apart.
     let ak = authorized_keys_path()?;
@@ -1124,10 +1518,10 @@ fn cmd_status(args: &[String]) -> Result<(), Fail> {
         root.display()
     ));
     note(&format!(
-        "{lines} {} in {}, {} couriers, {} grants, {held} waiting",
+        "{lines} {} in {}, {} may connect, {} grants, {held} waiting",
         if lines == 1 { "line" } else { "lines" },
         util_pretty(&ak),
-        couriers.len(),
+        lines,
         grants.len()
     ));
     // sshd is the one thing this depends on and the one thing it does not
